@@ -20,10 +20,18 @@ import (
 // taken modulo the number of bits of the filter. Bit n of the filter is
 // bit (n & 7) of byte n/8.
 //
-// BDAT header version 1 is the original hash, which sign-extends bytes >=
-// 0x80 when git was built with a signed char (x86); version 2 fixes it with
-// unsigned arithmetic. Both are supported; the version is read per layer
-// from BDAT. For paths made of bytes < 0x80 the two are identical.
+// BDAT header version 1 is the original hash, which uses plain char: it
+// sign-extends bytes >= 0x80 when git was built with a signed char (x86) but
+// not where char is unsigned (Linux arm64, ppc64, s390x), where it equals the
+// version 2 hash. The file does not say which one wrote it, so on a version 1
+// layer a key holding a byte >= 0x80 is tested with both hashes and the
+// answer is "maybe" if either matches; trying both can only add false
+// positives, never false negatives. Version 2 always uses unsigned
+// arithmetic. The version is read per layer from BDAT. For paths made of
+// bytes < 0x80 all hashes are identical.
+//
+// Only paths git inserts can be answered: see newBloomKey for the paths that
+// are reported as unknown.
 //
 // A filter of one byte 0x00 means "no changed path" and one byte 0xff means
 // "too many changed paths (more than 512)": the latter is reported as
@@ -37,20 +45,36 @@ const (
 )
 
 // bloomKey holds the precomputed hashes of a path for both hash versions. It
-// is a small value; build it once per path and reuse it for many commits.
+// is a small value; build it once per path and reuse it for many commits. The
+// zero value is not usable and always yields an unknown answer.
 type bloomKey struct {
-	v1, v2 [2]uint32
+	v1, v2 [2]uint32 // signed-char (version 1) and unsigned (version 2) hashes
+	high   bool      // the path has a byte >= 0x80, so v1 and v2 differ
+	usable bool      // git can have inserted this key
 }
 
 // newBloomKey computes the key of path. It does not allocate.
+//
+// One trailing slash is stripped, as git does for pathspecs, so "dir/" and
+// "dir" give the same key. A path git never inserts yields an unusable key,
+// for which every lookup is unknown (the caller must diff the trees): the
+// empty path, a path starting with "/", with an empty segment ("a//b", or a
+// second trailing slash), with a "." or ".." segment, or holding a NUL byte.
 func newBloomKey(path []byte) bloomKey {
-	k := bloomKey{v2: [2]uint32{
+	if n := len(path); n > 0 && path[n-1] == '/' {
+		path = path[:n-1]
+	}
+	if !bloomPathUsable(path) {
+		return bloomKey{}
+	}
+	k := bloomKey{usable: true, v2: [2]uint32{
 		murmur3Seeded(bloomSeed0, path, false),
 		murmur3Seeded(bloomSeed1, path, false),
 	}}
 	k.v1 = k.v2
 	for _, b := range path {
 		if b >= 0x80 {
+			k.high = true
 			k.v1 = [2]uint32{
 				murmur3Seeded(bloomSeed0, path, true),
 				murmur3Seeded(bloomSeed1, path, true),
@@ -59,6 +83,33 @@ func newBloomKey(path []byte) bloomKey {
 		}
 	}
 	return k
+}
+
+// bloomPathUsable reports whether path is a normalised, repository-relative
+// path whose segments are all non-empty and not "." or "..".
+func bloomPathUsable(path []byte) bool {
+	if len(path) == 0 {
+		return false
+	}
+	start := 0
+	for i := 0; i <= len(path); i++ {
+		if i < len(path) && path[i] != '/' {
+			if path[i] == 0 {
+				return false
+			}
+			continue
+		}
+		switch seg := path[start:i]; {
+		case len(seg) == 0:
+			return false
+		case len(seg) == 1 && seg[0] == '.':
+			return false
+		case len(seg) == 2 && seg[0] == '.' && seg[1] == '.':
+			return false
+		}
+		start = i + 1
+	}
+	return true
 }
 
 // newBloomKeyString is newBloomKey for a string path.
@@ -146,30 +197,42 @@ func (g *commitGraph) bloomFilter(pos uint32) (l *graphLayer, filter []byte, ok 
 // maybeChangedKey reports whether the path of k may have changed in the
 // commit at pos relative to its first parent. maybe=false is definitive (the
 // path did not change); maybe=true may be a false positive. ok=false means
-// the answer is unknown (no filter, too large, truncated, bad position) and
-// the caller must diff the trees.
+// the answer is unknown (unusable key, no filter, too large, truncated, bad
+// position) and the caller must diff the trees.
 func (g *commitGraph) maybeChangedKey(pos uint32, k *bloomKey) (maybe, ok bool) {
+	if !k.usable {
+		return false, false
+	}
 	l, f, ok := g.bloomFilter(pos)
 	if !ok {
 		return false, false
 	}
-	h := &k.v2
-	if l.bloomVersion == 1 {
-		h = &k.v1
+	if l.bloomVersion != 1 {
+		return bloomContains(f, l.bloomHashes, &k.v2), true
 	}
+	// Version 1: written with signed or unsigned chars depending on the
+	// platform of the writer; accept either when they differ.
+	if bloomContains(f, l.bloomHashes, &k.v1) {
+		return true, true
+	}
+	return k.high && bloomContains(f, l.bloomHashes, &k.v2), true
+}
+
+// bloomContains tests the probes of hash pair h against filter f.
+func bloomContains(f []byte, hashes uint32, h *[2]uint32) bool {
 	mod := uint64(len(f)) * 8
-	var h0, h1 = h[0], h[1]
-	for i := uint32(0); i < l.bloomHashes; i++ {
+	h0, h1 := h[0], h[1]
+	for i := uint32(0); i < hashes; i++ {
 		bit := uint64(h0+i*h1) % mod
 		if f[bit>>3]&(1<<(bit&7)) == 0 {
-			return false, true
+			return false
 		}
 	}
-	return true, true
+	return true
 }
 
 // maybeChanged is maybeChangedKey for a path given as bytes, without a
-// trailing slash, relative to the repository root. Use newBloomKey when
+// trailing slash (one is tolerated), relative to the repository root. Use newBloomKey when
 // testing the same path against many commits.
 func (g *commitGraph) maybeChanged(pos uint32, path []byte) (maybe, ok bool) {
 	k := newBloomKey(path)

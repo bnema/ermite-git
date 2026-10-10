@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 )
 
 // This file reads Git commit-graph files (gitformat-commit-graph): a single
@@ -25,11 +24,18 @@ import (
 // Lifecycle. openCommitGraph returns a graph holding one reference (the
 // owner's). A reader that may outlive a concurrent reopen calls retain
 // (which fails once the graph is closed) and release when done. The owner
-// calls close when it replaces the graph. The mappings are unmapped when the
-// last reference is dropped; no accessor may be used after that. Layers are
+// calls close when it replaces the graph; close is idempotent, only the first
+// call drops the owner's reference. The mappings are unmapped when the last
+// reference is dropped; no accessor may be used after that. Layers are
 // immutable files named after their checksum, so a concurrent
 // "git commit-graph write" never changes a mapped file; it can only delete
-// it, which does not affect an existing mapping.
+// it, which does not affect an existing mapping. It can however delete a
+// layer between the moment the chain is read and the moment the layer is
+// opened: openCommitGraph then starts again from the chain, and gives up with
+// errNoGraph (callers fall back to the objects) if that keeps happening.
+//
+// File mapping is done by mapFile (mmap_*.go), which falls back to reading
+// the file where mmap is unavailable.
 //
 // Positions are global across the chain: the commits of the base layer come
 // first, then those of the next layer, and so on. Within a layer commits are
@@ -116,58 +122,84 @@ type commitGraph struct {
 	genV2  bool // every layer has GDA2: generation() is a corrected date
 
 	refs   atomic.Int64
-	unmaps [][]byte
+	closed atomic.Bool
+	unmaps []func() error
 }
 
-// graphMmap maps a file read-only. The returned slice must be released with
-// syscall.Munmap.
-func graphMmap(path string) ([]byte, error) {
+// graphOpenRetries is how many times openCommitGraph starts over when a
+// layer disappears under it, after the first attempt.
+const graphOpenRetries = 3
+
+// graphBeforeLayerOpen, when set by a test, is called with the path of each
+// chain layer right before it is opened.
+var graphBeforeLayerOpen func(path string)
+
+// graphMmap maps a file read-only. The returned function releases the
+// mapping.
+func graphMmap(path string) ([]byte, func() error, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !st.Mode().IsRegular() {
-		return nil, graphCorruptf("%s: not a regular file", filepath.Base(path))
+		return nil, nil, graphCorruptf("%s: not a regular file", filepath.Base(path))
 	}
 	size := st.Size()
 	if size < graphHeaderSize+graphChunkEntrySize+graphHashSize {
-		return nil, graphCorruptf("%s: file too short (%d bytes)", filepath.Base(path), size)
+		return nil, nil, graphCorruptf("%s: file too short (%d bytes)", filepath.Base(path), size)
 	}
 	if size > math.MaxInt32 {
-		return nil, graphCorruptf("%s: file too large (%d bytes)", filepath.Base(path), size)
+		return nil, nil, graphCorruptf("%s: file too large (%d bytes)", filepath.Base(path), size)
 	}
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	data, unmap, err := mapFile(f, size)
 	if err != nil {
-		return nil, fmt.Errorf("mmap %s: %w", filepath.Base(path), err)
+		return nil, nil, fmt.Errorf("map %s: %w", filepath.Base(path), err)
 	}
-	_ = syscall.Madvise(data, syscall.MADV_RANDOM)
-	return data, nil
+	return data, unmap, nil
 }
 
 // openCommitGraph opens the commit-graph of the objects directory objectsDir:
 // objects/info/commit-graph if present, else the split chain. It returns
 // errNoGraph when there is none. The result holds one reference.
+//
+// A concurrent "git commit-graph write --split" can merge layers and delete
+// the old ones between the read of the chain and the open of a layer. The
+// chain is then read again, up to graphOpenRetries more times; if layers keep
+// disappearing the error wraps errNoGraph and the cause, so that callers fall
+// back to reading objects.
 func openCommitGraph(objectsDir string) (*commitGraph, error) {
+	var gone error
+	for attempt := 0; attempt <= graphOpenRetries; attempt++ {
+		g, err := openCommitGraphOnce(objectsDir)
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return g, err
+		}
+		gone = err
+	}
+	return nil, fmt.Errorf("%w: layers kept disappearing: %w", errNoGraph, gone)
+}
+
+func openCommitGraphOnce(objectsDir string) (*commitGraph, error) {
 	infoDir := filepath.Join(objectsDir, "info")
-	data, err := graphMmap(filepath.Join(infoDir, "commit-graph"))
+	data, unmap, err := graphMmap(filepath.Join(infoDir, "commit-graph"))
 	switch {
 	case err == nil:
 		l, perr := parseGraphLayer(data)
 		if perr != nil {
-			_ = syscall.Munmap(data)
+			_ = unmap()
 			return nil, fmt.Errorf("commit-graph: %w", perr)
 		}
 		g, aerr := assembleGraph([]*graphLayer{l}, nil)
 		if aerr != nil {
-			_ = syscall.Munmap(data)
+			_ = unmap()
 			return nil, fmt.Errorf("commit-graph: %w", aerr)
 		}
-		g.unmaps = [][]byte{data}
+		g.unmaps = []func() error{unmap}
 		return g, nil
 	case errors.Is(err, fs.ErrNotExist):
 		return openCommitGraphChain(infoDir)
@@ -183,20 +215,24 @@ func openCommitGraphChain(infoDir string) (*commitGraph, error) {
 		return nil, err
 	}
 	layers := make([]*graphLayer, 0, len(names))
-	maps := make([][]byte, 0, len(names))
+	unmaps := make([]func() error, 0, len(names))
 	cleanup := func() {
-		for _, m := range maps {
-			_ = syscall.Munmap(m)
+		for _, u := range unmaps {
+			_ = u()
 		}
 	}
 	for _, name := range names {
 		file := "graph-" + hex.EncodeToString(name[:]) + ".graph"
-		data, err := graphMmap(filepath.Join(dir, file))
+		path := filepath.Join(dir, file)
+		if graphBeforeLayerOpen != nil {
+			graphBeforeLayerOpen(path)
+		}
+		data, unmap, err := graphMmap(path)
 		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("commit-graph chain layer: %w", err)
 		}
-		maps = append(maps, data)
+		unmaps = append(unmaps, unmap)
 		l, err := parseGraphLayer(data)
 		if err != nil {
 			cleanup()
@@ -209,7 +245,7 @@ func openCommitGraphChain(infoDir string) (*commitGraph, error) {
 		cleanup()
 		return nil, fmt.Errorf("commit-graph chain: %w", err)
 	}
-	g.unmaps = maps
+	g.unmaps = unmaps
 	return g, nil
 }
 
@@ -367,8 +403,11 @@ func (l *graphLayer) validate() error {
 	if len(l.edge)%4 != 0 {
 		return graphCorruptf("EDGE chunk size %d not a multiple of 4", len(l.edge))
 	}
+	// Optional chunks of the wrong size disable their feature in this layer,
+	// as in git, instead of failing the layer. Without GDA2 in every layer
+	// generation() falls back to topological levels (see assembleGraph).
 	if l.gda2 != nil && uint64(len(l.gda2)) != n*4 {
-		return graphCorruptf("GDA2 chunk has size %d for %d commits", len(l.gda2), n)
+		l.gda2 = nil
 	}
 	if len(l.gdo2)%8 != 0 {
 		return graphCorruptf("GDO2 chunk size %d not a multiple of 8", len(l.gdo2))
@@ -379,14 +418,9 @@ func (l *graphLayer) validate() error {
 	if l.numBase == 0 && len(l.baseList) != 0 {
 		return graphCorruptf("BASE chunk present without base graphs")
 	}
-	// Bloom filters need both chunks; with only one of them git ignores it.
-	if l.bidx != nil && l.bdat != nil {
-		if uint64(len(l.bidx)) != n*4 {
-			return graphCorruptf("BIDX chunk has size %d for %d commits", len(l.bidx), n)
-		}
-		if len(l.bdat) < bloomHeaderSize {
-			return graphCorruptf("BDAT chunk too short (%d bytes)", len(l.bdat))
-		}
+	// Bloom filters need both chunks, correctly sized; otherwise git ignores
+	// them (the layer has no changed-path data).
+	if l.bidx != nil && l.bdat != nil && uint64(len(l.bidx)) == n*4 && len(l.bdat) >= bloomHeaderSize {
 		l.bloomVersion = binary.BigEndian.Uint32(l.bdat)
 		l.bloomHashes = binary.BigEndian.Uint32(l.bdat[4:])
 		l.bloomBits = binary.BigEndian.Uint32(l.bdat[8:])
@@ -410,6 +444,9 @@ func assembleGraph(layers []*graphLayer, names [][graphHashSize]byte) (*commitGr
 	if names != nil && len(names) != len(layers) {
 		return nil, graphCorruptf("%d layers for %d chain entries", len(layers), len(names))
 	}
+	if names == nil && len(layers) > 1 {
+		return nil, graphCorruptf("%d layers without chain entries", len(layers))
+	}
 	g := &commitGraph{layers: make([]graphLayer, len(layers)), genV2: true}
 	var total uint64
 	for k, l := range layers {
@@ -420,6 +457,9 @@ func assembleGraph(layers []*graphLayer, names [][graphHashSize]byte) (*commitGr
 			if !bytes.Equal(l.baseList[i*graphHashSize:(i+1)*graphHashSize], names[i][:]) {
 				return nil, graphCorruptf("layer %d: base graph %d does not match the chain", k, i)
 			}
+		}
+		if names != nil && !bytes.Equal(l.data[len(l.data)-graphHashSize:], names[k][:]) {
+			return nil, graphCorruptf("layer %d: checksum does not match its name in the chain", k)
 		}
 		l.base = uint32(total)
 		total += uint64(l.n)
@@ -436,8 +476,12 @@ func assembleGraph(layers []*graphLayer, names [][graphHashSize]byte) (*commitGr
 	return g, nil
 }
 
-// retain adds a reference. It reports false when the graph is already closed.
+// retain adds a reference. It reports false once the graph is closed, even
+// if readers still hold references.
 func (g *commitGraph) retain() bool {
+	if g.closed.Load() {
+		return false
+	}
 	for {
 		n := g.refs.Load()
 		if n <= 0 {
@@ -456,8 +500,8 @@ func (g *commitGraph) release() error {
 		return nil
 	case n == 0:
 		var first error
-		for _, m := range g.unmaps {
-			if err := syscall.Munmap(m); err != nil && first == nil {
+		for _, unmap := range g.unmaps {
+			if err := unmap(); err != nil && first == nil {
 				first = err
 			}
 		}
@@ -469,8 +513,14 @@ func (g *commitGraph) release() error {
 	}
 }
 
-// close drops the owner's reference.
-func (g *commitGraph) close() error { return g.release() }
+// close drops the owner's reference. Only the first call has an effect, so
+// calling it again never drops a reference held by a reader.
+func (g *commitGraph) close() error {
+	if !g.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return g.release()
+}
 
 // numCommits is the number of commits in the whole chain.
 func (g *commitGraph) numCommits() uint32 { return g.total }
@@ -590,14 +640,15 @@ func (g *commitGraph) topoLevel(pos uint32) (uint32, error) {
 // hasGenerationV2, else its topological level. In both cases a commit has a
 // strictly greater generation than each of its parents.
 func (g *commitGraph) generation(pos uint32) (uint64, error) {
-	l, rec, err := g.record(pos)
-	if err != nil {
-		return 0, err
+	l, idx := g.layerOf(pos)
+	if l == nil {
+		return 0, errGraphPosition
 	}
+	off := int(idx) * graphCommitSize
+	rec := l.cdat[off : off+graphCommitSize]
 	if !g.genV2 {
 		return uint64(binary.BigEndian.Uint32(rec[graphHashSize+8:]) >> 2), nil
 	}
-	_, idx := g.layerOf(pos)
 	v := binary.BigEndian.Uint32(l.gda2[int(idx)*4:])
 	offset := uint64(v)
 	if v&graphGenOverflow != 0 {
@@ -681,9 +732,7 @@ func statGraphFile(path string) graphFileStamp {
 		return graphFileStamp{}
 	}
 	s := graphFileStamp{exists: true, size: st.Size(), mtime: st.ModTime().UnixNano()}
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		s.ino = uint64(sys.Ino) //nolint:unconvert // width differs across platforms
-	}
+	s.ino = fileIno(st)
 	return s
 }
 

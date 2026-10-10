@@ -220,6 +220,8 @@ func TestBloomHighBitVersions(t *testing.T) {
 						key := newBloomKey([]byte(k))
 						other := key
 						other.v1, other.v2 = key.v2, key.v1
+						// A v1 layer tries both hashes: test one only.
+						other.high = false
 						if maybe, ok := g.maybeChangedKey(pos, &other); ok && !maybe {
 							wrong++
 						}
@@ -336,10 +338,115 @@ func TestBloomIgnoredSettings(t *testing.T) {
 			t.Errorf("version %d hashes %d should be unknown", c.version, c.hashes)
 		}
 	}
-	// BIDX without BDAT, BDAT too short.
-	s := &synthLayer{ids: synthIDs(2), bidx: []uint32{1, 2}, bdat: []byte{0, 0, 0, 2}}
-	if _, err := parseGraphLayer(s.bytes()); err == nil {
-		t.Error("short BDAT accepted")
+}
+
+// A wrongly sized BIDX or a BDAT shorter than its header disables the Bloom
+// filters of the layer only, like git; the rest of the layer stays usable.
+func TestBloomBadChunkDisablesFeature(t *testing.T) {
+	hdr := binary.BigEndian.AppendUint32(nil, 2)
+	hdr = binary.BigEndian.AppendUint32(hdr, 7)
+	hdr = binary.BigEndian.AppendUint32(hdr, 10)
+	for name, s := range map[string]*synthLayer{
+		"short BDAT":    {ids: synthIDs(2), bidx: []uint32{1, 2}, bdat: []byte{0, 0, 0, 2}},
+		"empty BDAT":    {ids: synthIDs(2), bidx: []uint32{1, 2}, bdat: []byte{}},
+		"BIDX too few":  {ids: synthIDs(3), bidx: []uint32{1, 2}, bdat: append(hdr[:12:12], 0, 0)},
+		"BIDX too many": {ids: synthIDs(2), bidx: []uint32{1, 2, 2}, bdat: append(hdr[:12:12], 0, 0)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := mustParseSynth(t, s.bytes())
+			defer func() { _ = g.close() }()
+			if g.layers[0].hasBloom {
+				t.Fatal("hasBloom")
+			}
+			for pos := range g.numCommits() {
+				if g.hasBloom(pos) {
+					t.Errorf("pos %d: hasBloom", pos)
+				}
+				if _, ok := g.maybeChanged(pos, []byte("a")); ok {
+					t.Errorf("pos %d: answer without filter", pos)
+				}
+				id, err := g.commitID(pos)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, ok := g.lookup(id); !ok || got != pos {
+					t.Errorf("lookup(%d) = %d, %v", pos, got, ok)
+				}
+			}
+		})
+	}
+}
+
+// A v1 filter written where char is unsigned (Linux arm64, ppc64, s390x) holds
+// the same bits as a v2 one. It must be found as well as one written with
+// signed chars.
+func TestBloomV1UnsignedWriter(t *testing.T) {
+	const hashes = 7
+	path := []byte("d\xe9\xff/\xc3\xa9.txt")
+	k := newBloomKey(path)
+	if !k.high || k.v1 == k.v2 {
+		t.Fatal("test path does not distinguish the hashes")
+	}
+	signed := make([]byte, 64)
+	setBloomBits(signed, hashes, k, true)
+	unsigned := make([]byte, 64)
+	setBloomBits(unsigned, hashes, k, false)
+	other := make([]byte, 64)
+	setBloomBits(other, hashes, newBloomKey([]byte("zz/other")), false)
+	g := synthBloom(t, 1, hashes, 10, [][]byte{signed, unsigned, other})
+	defer func() { _ = g.close() }()
+	for pos, want := range []bool{true, true, false} {
+		if maybe, ok := g.maybeChanged(uint32(pos), path); !ok || maybe != want {
+			t.Errorf("v1 filter %d: maybe=%v ok=%v, want %v", pos, maybe, ok, want)
+		}
+	}
+	// A v2 layer must not accept the signed hash.
+	g2 := synthBloom(t, 2, hashes, 10, [][]byte{signed, unsigned})
+	defer func() { _ = g2.close() }()
+	if maybe, _ := g2.maybeChanged(0, path); maybe {
+		t.Error("v2 layer matched a signed-char filter")
+	}
+	if maybe, _ := g2.maybeChanged(1, path); !maybe {
+		t.Error("v2 layer missed an unsigned filter")
+	}
+}
+
+// Keys git never inserts are unknown, not "unchanged".
+func TestBloomUnusableKeys(t *testing.T) {
+	const hashes = 7
+	f := make([]byte, 64)
+	for _, p := range []string{"a/b", "a", ".hidden", "..x", "a/.b"} {
+		setBloomBits(f, hashes, newBloomKey([]byte(p)), false)
+	}
+	g := synthBloom(t, 2, hashes, 10, [][]byte{f, {0x00}})
+	defer func() { _ = g.close() }()
+
+	for _, p := range []string{"", "/", "//", "/a", "/a/b", "a//b", "a/b//", "./a", "a/./b", "a/.", ".", "..",
+		"../a", "a/../b", "a/..", "a\x00b"} {
+		for pos := range uint32(2) {
+			if maybe, ok := g.maybeChanged(pos, []byte(p)); ok || maybe {
+				t.Errorf("%q at %d: maybe=%v ok=%v, want unknown", p, pos, maybe, ok)
+			}
+		}
+		if k := newBloomKey([]byte(p)); k.usable {
+			t.Errorf("%q: key usable", p)
+		}
+	}
+	// One trailing slash is dropped, like git does.
+	for _, p := range []string{"a/b", "a/b/", "a", "a/", ".hidden", "..x", "a/.b/"} {
+		if maybe, ok := g.maybeChanged(0, []byte(p)); !ok || !maybe {
+			t.Errorf("%q: maybe=%v ok=%v, want found", p, maybe, ok)
+		}
+		if maybe, ok := g.maybeChanged(1, []byte(p)); !ok || maybe {
+			t.Errorf("%q in empty filter: maybe=%v ok=%v", p, maybe, ok)
+		}
+	}
+	if newBloomKey([]byte("a/b/")) != newBloomKey([]byte("a/b")) {
+		t.Error("trailing slash changes the key")
+	}
+	var zero bloomKey
+	if _, ok := g.maybeChangedKey(0, &zero); ok {
+		t.Error("zero key must be unknown")
 	}
 }
 
@@ -388,6 +495,12 @@ func FuzzBloomLookup(f *testing.F) {
 			if maybe && !ok {
 				t.Fatal("maybe without ok")
 			}
+			if ok && !k.usable {
+				t.Fatal("answer for an unusable key")
+			}
+		}
+		if !k.usable {
+			return
 		}
 		// A path inserted into a valid filter is always found.
 		half := len(filter) / 2
@@ -402,6 +515,20 @@ func FuzzBloomLookup(f *testing.F) {
 			g2 := &commitGraph{layers: []graphLayer{*l2}, total: l2.n}
 			if maybe, ok := g2.maybeChangedKey(1, &k); ok && !maybe {
 				t.Fatal("false negative after insertion")
+			}
+			if version == 1 {
+				// The same filter written with the unsigned hash.
+				third := append([]byte(nil), filter[half:]...)
+				setBloomBits(third, hashes, k, false)
+				s.bdat = append(append(hdr[:12:12], filter[:half]...), third...)
+				l3, err := parseGraphLayer(s.bytes())
+				if err != nil {
+					t.Fatal(err)
+				}
+				g3 := &commitGraph{layers: []graphLayer{*l3}, total: l3.n}
+				if maybe, ok := g3.maybeChangedKey(1, &k); ok && !maybe {
+					t.Fatal("false negative with an unsigned v1 writer")
+				}
 			}
 		}
 	})

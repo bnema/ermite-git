@@ -9,13 +9,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // oid is the raw object id used by the graph code until the core's ObjectID
@@ -505,6 +509,132 @@ func TestGraphRefcount(t *testing.T) {
 	}
 }
 
+// close is idempotent: a second call must not drop a reader's reference.
+func TestGraphCloseIdempotent(t *testing.T) {
+	r := newGTRepo(t)
+	r.commit("a", "a\n")
+	r.git("commit-graph", "write", "--reachable")
+	g, err := openCommitGraph(r.objects())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.retain() {
+		t.Fatal("retain failed on open graph")
+	}
+	var unmapped atomic.Int32
+	for i, u := range g.unmaps {
+		g.unmaps[i] = func() error { unmapped.Add(1); return u() }
+	}
+	for range 3 {
+		if err := g.close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if unmapped.Load() != 0 {
+		t.Fatal("unmapped while a reader holds a reference")
+	}
+	if g.retain() {
+		t.Fatal("retain succeeded after close")
+	}
+	if _, err := g.commitID(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.release(); err != nil {
+		t.Fatal(err)
+	}
+	if unmapped.Load() != int32(len(g.layers)) {
+		t.Fatalf("unmapped %d files, want %d", unmapped.Load(), len(g.layers))
+	}
+	if err := g.close(); err != nil {
+		t.Fatal(err)
+	}
+	if unmapped.Load() != int32(len(g.layers)) {
+		t.Fatal("close after the last release unmapped again")
+	}
+}
+
+// Readers retain, read and release while the owner closes (more than once).
+// The files must never be unmapped while a reader holds a reference; a read
+// of an unmapped file would also crash the test.
+func TestGraphConcurrentCloseRetain(t *testing.T) {
+	r := newGTRepo(t)
+	for i := range 5 {
+		r.commit(fmt.Sprintf("f%d", i), "x\n")
+		r.git("commit-graph", "write", "--reachable", "--split=no-merge", "--changed-paths")
+	}
+	const readers = 16
+	rounds := 20
+	if testing.Short() {
+		rounds = 3
+	}
+	for range rounds {
+		g, err := openCommitGraph(r.objects())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var active, unmapped atomic.Int32
+		for i, u := range g.unmaps {
+			g.unmaps[i] = func() error {
+				if active.Load() != 0 {
+					t.Error("unmapped while referenced")
+				}
+				unmapped.Store(1)
+				return u()
+			}
+		}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var retained atomic.Int64
+		for range readers {
+			wg.Go(func() {
+				<-start
+				for range 200 {
+					if !g.retain() {
+						return
+					}
+					retained.Add(1)
+					active.Add(1)
+					if unmapped.Load() != 0 {
+						t.Error("reference granted on unmapped graph")
+					}
+					for pos := range g.numCommits() {
+						id, err := g.commitID(pos)
+						if err != nil {
+							t.Error(err)
+						}
+						if got, ok := g.lookup(id); !ok || got != pos {
+							t.Errorf("lookup(%d) = %d, %v", pos, got, ok)
+						}
+						if _, err := g.appendParents(nil, pos); err != nil {
+							t.Error(err)
+						}
+						g.maybeChanged(pos, []byte("f1"))
+					}
+					active.Add(-1)
+					if err := g.release(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+		}
+		close(start)
+		for range 3 {
+			wg.Go(func() {
+				if err := g.close(); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		wg.Wait()
+		if unmapped.Load() != 1 {
+			t.Fatal("files never unmapped")
+		}
+		if g.retain() {
+			t.Fatal("retain succeeded after close")
+		}
+	}
+}
+
 // A layer removed or rewritten while a graph is open must not affect it.
 func TestGraphSurvivesRewrite(t *testing.T) {
 	r := newGTRepo(t)
@@ -529,6 +659,124 @@ func TestGraphSurvivesRewrite(t *testing.T) {
 		if _, err := g.commitID(pos); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// setLayerHook installs graphBeforeLayerOpen for the duration of the test.
+func setLayerHook(t *testing.T, f func(path string)) {
+	t.Helper()
+	graphBeforeLayerOpen = f
+	t.Cleanup(func() { graphBeforeLayerOpen = nil })
+}
+
+// splitChainRepo has a graph chain of several layers.
+func splitChainRepo(t *testing.T) *gtRepo {
+	r := newGTRepo(t)
+	for i := range 3 {
+		r.commit(fmt.Sprintf("f%d", i), "x\n")
+		r.git("commit-graph", "write", "--reachable", "--split=no-merge", "--changed-paths")
+	}
+	return r
+}
+
+// A concurrent merging "commit-graph write --split" deletes the layers named
+// by the chain just read: opening starts again and succeeds.
+func TestGraphOpenRetriesVanishedLayer(t *testing.T) {
+	r := splitChainRepo(t)
+	calls := 0
+	setLayerHook(t, func(string) {
+		if calls++; calls == 1 {
+			r.git("commit-graph", "write", "--reachable", "--split=replace", "--changed-paths", "--expire-time=now")
+		}
+	})
+	g, err := openCommitGraph(r.objects())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = g.close() }()
+	if g.numLayers() != 1 {
+		t.Fatalf("layers = %d, want the replaced chain of 1", g.numLayers())
+	}
+	checkGraphAgainstGit(t, r.dir, g, false)
+}
+
+// Layers that keep vanishing end in errNoGraph, which callers treat as
+// "read the objects instead", wrapping the cause.
+func TestGraphOpenGivesUpOnVanishedLayer(t *testing.T) {
+	r := splitChainRepo(t)
+	calls := 0
+	setLayerHook(t, func(path string) {
+		calls++
+		_ = os.Remove(path)
+	})
+	g, err := openCommitGraph(r.objects())
+	if err == nil {
+		_ = g.close()
+		t.Fatal("opened a graph with a missing layer")
+	}
+	if !errors.Is(err, errNoGraph) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v, want errNoGraph wrapping ErrNotExist", err)
+	}
+	if calls != 1+graphOpenRetries {
+		t.Fatalf("%d attempts, want %d", calls, 1+graphOpenRetries)
+	}
+}
+
+// Opening in a loop while git rewrites the chain: success or errNoGraph only.
+func TestGraphOpenStressSplitWrite(t *testing.T) {
+	r := newGTRepo(t)
+	r.commit("a", "a\n")
+	r.git("commit-graph", "write", "--reachable", "--split", "--changed-paths")
+	commits := 150
+	if testing.Short() {
+		commits = 10
+	}
+	var done atomic.Bool
+	writerErr := make(chan error, 1)
+	go func() {
+		defer done.Store(true)
+		for i := range commits {
+			for _, args := range [][]string{
+				{"commit", "-q", "--allow-empty", "-m", fmt.Sprint("s", i)},
+				{"commit-graph", "write", "--reachable", "--split", "--changed-paths", "--expire-time=now"},
+			} {
+				cmd := exec.Command("git", args...)
+				cmd.Dir = r.dir
+				cmd.Env = graphGitEnv(0)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					writerErr <- fmt.Errorf("git %v: %v\n%s", args, err, out)
+					return
+				}
+			}
+		}
+		writerErr <- nil
+	}()
+	// Count the layer opens beyond the chain length: retries.
+	var layerOpens atomic.Int64
+	setLayerHook(t, func(string) { layerOpens.Add(1) })
+	var opened, none int
+	deadline := time.Now().Add(2 * time.Minute)
+	for !done.Load() && time.Now().Before(deadline) {
+		g, err := openCommitGraph(r.objects())
+		switch {
+		case err == nil:
+			opened++
+			if g.numCommits() == 0 {
+				t.Error("empty graph")
+			}
+			_ = g.close()
+		case errors.Is(err, errNoGraph):
+			none++
+		default:
+			t.Fatalf("open: %v", err)
+		}
+	}
+	if err := <-writerErr; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("opened %d, no graph %d, layer opens %d", opened, none, layerOpens.Load())
+	if opened == 0 {
+		t.Error("never opened a graph")
 	}
 }
 
@@ -939,6 +1187,148 @@ func TestGraphChainMismatch(t *testing.T) {
 	}
 }
 
+// A layer file whose trailer is not the name the chain gives it is rejected.
+func TestGraphLayerChecksumMustMatchName(t *testing.T) {
+	mk := func(sum byte, base []oid) *graphLayer {
+		s := &synthLayer{ids: synthIDs(3), base: base}
+		b := s.bytes()
+		for i := len(b) - graphHashSize; i < len(b); i++ {
+			b[i] = sum
+		}
+		l, err := parseGraphLayer(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+	name := func(b byte) [graphHashSize]byte { return [graphHashSize]byte(bytes.Repeat([]byte{b}, graphHashSize)) }
+	chain := func(a, b byte) (*commitGraph, error) {
+		return assembleGraph([]*graphLayer{mk(0xa1, nil), mk(0xb2, []oid{name(0xa1)})},
+			[][graphHashSize]byte{name(a), name(b)})
+	}
+	if _, err := chain(0xa1, 0xb2); err != nil {
+		t.Fatalf("matching names: %v", err)
+	}
+	if _, err := chain(0xa1, 0xb3); !errors.Is(err, errGraphCorrupt) {
+		t.Errorf("top layer renamed: err = %v", err)
+	}
+	// The base list of the top layer names the base correctly, but the base
+	// file itself carries another checksum.
+	if _, err := assembleGraph([]*graphLayer{mk(0xee, nil), mk(0xb2, []oid{name(0xa1)})},
+		[][graphHashSize]byte{name(0xa1), name(0xb2)}); !errors.Is(err, errGraphCorrupt) {
+		t.Errorf("base layer with another checksum: err = %v", err)
+	}
+	// Several layers need chain names.
+	if _, err := assembleGraph([]*graphLayer{mk(1, nil), mk(2, []oid{name(1)})}, nil); !errors.Is(err, errGraphCorrupt) {
+		t.Errorf("two layers without names: err = %v", err)
+	}
+}
+
+// On disk: a layer copied under another name is not accepted as that layer.
+func TestGraphRenamedLayerRejected(t *testing.T) {
+	r := newGTRepo(t)
+	r.commit("a", "a\n")
+	r.git("commit-graph", "write", "--reachable", "--split")
+	dir := filepath.Join(r.objects(), "info", "commit-graphs")
+	chainPath := filepath.Join(dir, "commit-graph-chain")
+	raw, err := os.ReadFile(chainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := strings.TrimSpace(string(raw))
+	fake := strings.Repeat("0", 40)
+	b, err := os.ReadFile(filepath.Join(dir, "graph-"+good+".graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "graph-"+fake+".graph"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(chainPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(chainPath, []byte(fake+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := openCommitGraph(r.objects()); !errors.Is(err, errGraphCorrupt) {
+		if err == nil {
+			_ = g.close()
+		}
+		t.Fatalf("err = %v, want corrupt", err)
+	}
+}
+
+// Optional chunks of the wrong size disable their feature only.
+func TestGraphOptionalChunkSizes(t *testing.T) {
+	const n = 4
+	hdr := binary.BigEndian.AppendUint32(nil, 2)
+	hdr = binary.BigEndian.AppendUint32(hdr, 7)
+	hdr = binary.BigEndian.AppendUint32(hdr, 10)
+	mk := func() *synthLayer {
+		s := &synthLayer{ids: synthIDs(n), parents: make([][]uint32, n), times: make([]int64, n), levels: []uint32{5, 6, 7, 8}}
+		s.times = []int64{100, 200, 300, 400}
+		s.parents[1] = []uint32{0}
+		s.gda2 = []uint32{0, 1, 2, 3}
+		s.bdat = append(hdr[:12:12], 0x00)
+		s.bidx = []uint32{1, 1, 1, 1}
+		return s
+	}
+	t.Run("ok", func(t *testing.T) {
+		g := mustParseSynth(t, mk().bytes())
+		defer func() { _ = g.close() }()
+		if !g.hasGenerationV2() || !g.layers[0].hasBloom {
+			t.Fatal("features missing on a good layer")
+		}
+		if v, _ := g.generation(1); v != 201 {
+			t.Fatalf("generation = %d, want 201", v)
+		}
+	})
+	t.Run("GDA2", func(t *testing.T) {
+		for _, size := range []int{n - 1, n + 1} {
+			s := mk()
+			s.gda2 = make([]uint32, size)
+			g := mustParseSynth(t, s.bytes())
+			if g.hasGenerationV2() {
+				t.Errorf("GDA2 of %d entries accepted", size)
+			}
+			if v, err := g.generation(1); err != nil || v != 6 {
+				t.Errorf("generation = %d, %v, want the level 6", v, err)
+			}
+			if !g.layers[0].hasBloom {
+				t.Error("a bad GDA2 disabled the Bloom filters")
+			}
+			if _, err := g.appendParents(nil, 1); err != nil {
+				t.Error(err)
+			}
+			_ = g.close()
+		}
+	})
+	t.Run("BIDX", func(t *testing.T) {
+		s := mk()
+		s.bidx = s.bidx[:n-1]
+		g := mustParseSynth(t, s.bytes())
+		defer func() { _ = g.close() }()
+		if g.layers[0].hasBloom || g.hasBloom(0) {
+			t.Error("short BIDX accepted")
+		}
+		if !g.hasGenerationV2() {
+			t.Error("a bad BIDX disabled the generation")
+		}
+	})
+	t.Run("BDAT", func(t *testing.T) {
+		s := mk()
+		s.bdat = s.bdat[:bloomHeaderSize-1]
+		g := mustParseSynth(t, s.bytes())
+		defer func() { _ = g.close() }()
+		if g.layers[0].hasBloom || g.hasBloom(0) {
+			t.Error("short BDAT accepted")
+		}
+		if !g.hasGenerationV2() {
+			t.Error("a bad BDAT disabled the generation")
+		}
+	})
+}
+
 func TestGraphCorruptFiles(t *testing.T) {
 	r := newGTRepo(t)
 	r.commit("a", "a\n")
@@ -986,25 +1376,31 @@ func exerciseGraphBytes(data []byte) {
 		{layers: []graphLayer{one}, total: one.n, genV2: one.gda2 != nil},
 		{layers: []graphLayer{one, two}, total: 2 * one.n, genV2: one.gda2 != nil},
 	} {
-		var buf [4]uint32
-		n := min(g.total, 256)
-		for pos := range n {
-			id, _ := g.commitID(pos)
-			g.lookup(id)
-			_, _ = g.rootTree(pos)
-			_, _ = g.commitTime(pos)
-			_, _ = g.topoLevel(pos)
-			_, _ = g.generation(pos)
-			_, _ = g.appendParents(buf[:0], pos)
-			g.maybeChanged(pos, []byte("src/main.go"))
-			g.hasBloom(pos)
-		}
-		_, _ = g.commitID(g.total)
-		_, _ = g.appendParents(nil, g.total+1)
-		g.maybeChanged(g.total, nil)
-		g.lookup(oid{0xff, 0xff})
-		g.lookup(oid{})
+		exerciseGraph(g)
 	}
+}
+
+// exerciseGraph runs every accessor over (up to 256 positions of) g.
+func exerciseGraph(g *commitGraph) {
+	var buf [4]uint32
+	n := min(g.total, 256)
+	for pos := range n {
+		id, _ := g.commitID(pos)
+		g.lookup(id)
+		_, _ = g.rootTree(pos)
+		_, _ = g.commitTime(pos)
+		_, _ = g.topoLevel(pos)
+		_, _ = g.generation(pos)
+		_, _ = g.appendParents(buf[:0], pos)
+		g.maybeChanged(pos, []byte("src/main.go"))
+		g.maybeChanged(pos, []byte("caf\xc3\xa9/"))
+		g.hasBloom(pos)
+	}
+	_, _ = g.commitID(g.total)
+	_, _ = g.appendParents(nil, g.total+1)
+	g.maybeChanged(g.total, nil)
+	g.lookup(oid{0xff, 0xff})
+	g.lookup(oid{})
 }
 
 func graphSeedFiles(tb testing.TB) map[string][]byte {
@@ -1047,6 +1443,88 @@ func FuzzGraphChain(f *testing.F) {
 		if err == nil && len(names)*41 != len(data) {
 			t.Fatalf("parsed %d names from %d bytes", len(names), len(data))
 		}
+	})
+}
+
+// graphChainSeeds returns, for each committed split chain, the chain file
+// content and its layer files (base first).
+func graphChainSeeds(tb testing.TB) (chains [][]byte, layers [][2][]byte) {
+	tb.Helper()
+	seeds := graphSeedFiles(tb)
+	for _, prefix := range []string{"split-bloom-v1", "split-bloom-v2", "split-gen1"} {
+		l0, l1 := seeds[prefix+"-layer0.graph"], seeds[prefix+"-layer1.graph"]
+		if l0 == nil || l1 == nil {
+			tb.Fatalf("seed %s missing", prefix)
+		}
+		chain := hex.EncodeToString(l0[len(l0)-graphHashSize:]) + "\n" +
+			hex.EncodeToString(l1[len(l1)-graphHashSize:]) + "\n"
+		chains = append(chains, []byte(chain))
+		layers = append(layers, [2][]byte{l0, l1})
+	}
+	return chains, layers
+}
+
+// assembleChainBytes is openCommitGraphChain on in-memory files: layer i of
+// the chain is files[i%len(files)].
+func assembleChainBytes(chain []byte, files ...[]byte) (*commitGraph, error) {
+	names, err := parseGraphChain(chain)
+	if err != nil {
+		return nil, err
+	}
+	layers := make([]*graphLayer, 0, len(names))
+	for i := range names {
+		l, err := parseGraphLayer(files[i%len(files)])
+		if err != nil {
+			return nil, err
+		}
+		layers = append(layers, l)
+	}
+	return assembleGraph(layers, names)
+}
+
+func TestGraphChainSeedsAssemble(t *testing.T) {
+	chains, layers := graphChainSeeds(t)
+	for i := range chains {
+		g, err := assembleChainBytes(chains[i], layers[i][0], layers[i][1])
+		if err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+		if g.numLayers() != 2 || g.numCommits() == 0 {
+			t.Errorf("seed %d: %d layers, %d commits", i, g.numLayers(), g.numCommits())
+		}
+		exerciseGraph(g)
+		// Swapped layers or a damaged name must be refused, not crash.
+		if _, err := assembleChainBytes(chains[i], layers[i][1], layers[i][0]); err == nil {
+			t.Errorf("seed %d: swapped layers accepted", i)
+		}
+		bad := append([]byte(nil), chains[i]...)
+		bad[3] ^= 1
+		if _, err := assembleChainBytes(bad, layers[i][0], layers[i][1]); !errors.Is(err, errGraphCorrupt) {
+			t.Errorf("seed %d: wrong layer name: err = %v", i, err)
+		}
+	}
+}
+
+// FuzzGraphAssemble reaches parseGraphChain, parseGraphLayer and
+// assembleGraph together: a chain file and two layer files (used round-robin
+// for the layers the chain lists).
+func FuzzGraphAssemble(f *testing.F) {
+	chains, layers := graphChainSeeds(f)
+	for i := range chains {
+		f.Add(chains[i], layers[i][0], layers[i][1])
+		f.Add(chains[i][:41], layers[i][0], layers[i][1]) // base layer alone
+		f.Add(append(chains[i][:41:41], chains[i][:41]...), layers[i][0], layers[i][0])
+	}
+	f.Add([]byte(strings.Repeat("00", 20)+"\n"), (&synthLayer{ids: synthIDs(3)}).bytes(), []byte{})
+	f.Fuzz(func(t *testing.T, chain, l0, l1 []byte) {
+		g, err := assembleChainBytes(chain, l0, l1)
+		if err != nil {
+			return
+		}
+		if g.numLayers() == 0 || g.numLayers() > graphMaxLayers {
+			t.Fatalf("%d layers", g.numLayers())
+		}
+		exerciseGraph(g)
 	})
 }
 
