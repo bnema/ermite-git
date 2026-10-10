@@ -125,8 +125,13 @@ func (fx *benchFixture) finish(b *testing.B, gitDir string) {
 			var id ObjectID
 			copy(id[:], p.idx.id(i))
 			switch {
-			case h.isDelta() && h.size > 200:
-				typ, _ := p.chainEnd(off, h)
+			case h.isDelta():
+				// The size of a delta is that of the delta, not of the
+				// object: do not filter on it.
+				typ, err := p.chainEnd(off, h)
+				if err != nil {
+					b.Fatal(err)
+				}
 				if typ == TypeBlob && fx.deltaBlob.IsZero() {
 					fx.deltaBlob = id
 				}
@@ -146,15 +151,9 @@ func (fx *benchFixture) finish(b *testing.B, gitDir string) {
 	if fx.looseBlob.IsZero() {
 		fx.looseBlob = fx.packedBlob
 	}
-	if fx.deltaBlob.IsZero() {
-		fx.deltaBlob = fx.packedBlob
-	}
-	if fx.deltaTree.IsZero() {
-		var c Commit
-		if err := fx.r.ReadCommit(fx.headCommit, &c); err != nil {
-			b.Fatal(err)
-		}
-		fx.deltaTree = c.Tree
+	if fx.deltaBlob.IsZero() || fx.deltaTree.IsZero() {
+		b.Fatalf("no deltified blob (%v) or tree (%v) in the packs of %s: the deltified benchmarks would measure something else",
+			!fx.deltaBlob.IsZero(), !fx.deltaTree.IsZero(), gitDir)
 	}
 	if fx.bigTree.IsZero() {
 		var c Commit
