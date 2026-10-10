@@ -34,6 +34,10 @@ type pathSpec struct {
 	// filters: spelled without a "." or ".." component, an empty one, or
 	// more than one trailing slash. Otherwise the trees are compared.
 	bloom bool
+	// dirOnly is set by a trailing slash: the last component then matches
+	// a directory or a submodule, never a file ("f/" finds nothing when f
+	// is a file).
+	dirOnly bool
 }
 
 // parsePathSpec normalises p: empty and "." components are dropped, ".."
@@ -46,7 +50,7 @@ func parsePathSpec(p string) (pathSpec, error) {
 	if strings.HasPrefix(p, "/") {
 		return pathSpec{}, fmt.Errorf("%w: %q is absolute", ErrInvalidPath, p)
 	}
-	s := pathSpec{bloom: true}
+	s := pathSpec{bloom: true, dirOnly: strings.HasSuffix(p, "/")}
 	t := strings.TrimSuffix(p, "/")
 	if t == "" {
 		s.bloom = false // the root: every commit with a changed tree
@@ -92,15 +96,17 @@ const maxLookupCache = 1 << 14
 // pathDiffer answers TREESAME questions for one path. It is not safe for
 // concurrent use.
 type pathDiffer struct {
-	r     *Repo
-	comps []string
-	names [][]byte
-	cache map[lookupKey]pathEntry
-	buf   []byte
+	r       *Repo
+	comps   []string
+	dirOnly bool
+	names   [][]byte
+	cache   map[lookupKey]pathEntry
+	buf     []byte
 }
 
-func newPathDiffer(r *Repo, comps []string) *pathDiffer {
-	d := &pathDiffer{r: r, comps: comps, cache: make(map[lookupKey]pathEntry, 256)}
+func newPathDiffer(r *Repo, spec pathSpec) *pathDiffer {
+	comps := spec.comps
+	d := &pathDiffer{r: r, comps: comps, dirOnly: spec.dirOnly, cache: make(map[lookupKey]pathEntry, 256)}
 	d.names = make([][]byte, len(comps))
 	for i, c := range comps {
 		d.names[i] = []byte(c)
@@ -166,6 +172,14 @@ func findEntry(data, name []byte) (pathEntry, error) {
 	return pathEntry{}, nil
 }
 
+// final applies the trailing-slash rule to the entry found at the full path.
+func (d *pathDiffer) final(e pathEntry) pathEntry {
+	if d.dirOnly && e.found && !e.mode.IsTree() && !e.mode.IsGitlink() {
+		return pathEntry{}
+	}
+	return e
+}
+
 // resolve returns the entry at the path below the root tree. The root path
 // (no component) resolves to the tree itself.
 func (d *pathDiffer) resolve(root ObjectID) (pathEntry, error) {
@@ -180,7 +194,7 @@ func (d *pathDiffer) resolve(root ObjectID) (pathEntry, error) {
 		}
 		cur = e
 	}
-	return cur, nil
+	return d.final(cur), nil
 }
 
 // child returns what the directory entry e holds at comps[level]: absent when
@@ -199,11 +213,11 @@ func (d *pathDiffer) same(a, b ObjectID) (bool, error) {
 	ea := pathEntry{id: a, mode: ModeTree, found: true}
 	eb := pathEntry{id: b, mode: ModeTree, found: true}
 	for i := 0; ; i++ {
+		if i == len(d.comps) {
+			return d.final(ea) == d.final(eb), nil
+		}
 		if ea == eb {
 			return true, nil
-		}
-		if i == len(d.comps) {
-			return false, nil
 		}
 		var err error
 		if ea, err = d.child(ea, i); err != nil {

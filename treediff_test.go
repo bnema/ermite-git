@@ -76,7 +76,7 @@ func TestPathDiffer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := newPathDiffer(r, spec.comps)
+		d := newPathDiffer(r, spec)
 		for i := range trees {
 			for j := range trees {
 				got, err := d.same(trees[i], trees[j])

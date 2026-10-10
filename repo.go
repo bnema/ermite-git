@@ -66,6 +66,9 @@ type Repo struct {
 
 	packed atomic.Pointer[packedRefs]
 	pmu    sync.Mutex // serializes packed-refs reloads
+
+	graph atomic.Pointer[graphState] // see walk.go
+	gmu   sync.Mutex                 // serializes commit-graph reloads
 }
 
 // Open opens the repository whose Git directory is dir: a bare repository
@@ -104,6 +107,7 @@ func Open(dir string, opts ...Option) (*Repo, error) {
 		_ = r.Close()
 		return nil, err
 	}
+	_ = r.refreshGraph(true) // a bad commit-graph is reported by Walk
 	return r, nil
 }
 
@@ -122,6 +126,7 @@ func (r *Repo) Close() error {
 	if s := r.snap.Swap(nil); s != nil {
 		s.release()
 	}
+	r.closeGraph()
 	return nil
 }
 
@@ -137,8 +142,10 @@ func (r *Repo) Refresh() error {
 	if _, err := r.reloadPacks(false); err != nil {
 		return err
 	}
-	_, err := r.loadPacked(false)
-	return err
+	if _, err := r.loadPacked(false); err != nil {
+		return err
+	}
+	return r.refreshGraph(false)
 }
 
 func findGitDir(dir string) (string, error) {
