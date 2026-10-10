@@ -13,40 +13,55 @@ import (
 	"time"
 )
 
-// fileSig identifies a version of a file or directory by stat data.
+// fileSig identifies a version of a file or directory by stat data, and
+// remembers when that data was read.
 type fileSig struct {
 	exists bool
 	size   int64
 	mtime  int64 // unix nanoseconds
 	ino    uint64
+	read   int64 // unix nanoseconds: when the file was stat'ed or read
 }
 
-func sigOf(fi os.FileInfo) fileSig {
-	return fileSig{exists: true, size: fi.Size(), mtime: fi.ModTime().UnixNano(), ino: fileIno(fi)}
+// sigOf returns the signature of fi, which was obtained at read (unix
+// nanoseconds). Take read before reading the content: a change that happens
+// later is then never mistaken for the version that was read.
+func sigOf(fi os.FileInfo, read int64) fileSig {
+	return fileSig{exists: true, size: fi.Size(), mtime: fi.ModTime().UnixNano(), ino: fileIno(fi), read: read}
 }
 
 func statSig(path string) (fileSig, error) {
+	read := time.Now().UnixNano()
 	fi, err := os.Stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return fileSig{}, nil
+		return fileSig{read: read}, nil
 	}
 	if err != nil {
 		return fileSig{}, err
 	}
-	return sigOf(fi), nil
+	return sigOf(fi, read), nil
 }
 
 // racyWindow is how long after its modification time a file may still change
 // without its stat data changing, because of coarse file system clocks.
 const racyWindow = 2 * time.Second
 
+// sameStat reports whether a and b have the same stat data, whenever they
+// were read.
+func (a fileSig) sameStat(b fileSig) bool {
+	return a.exists == b.exists && a.size == b.size && a.mtime == b.mtime && a.ino == b.ino
+}
+
 // same reports whether b is the same version as a and can be trusted to be
-// unchanged.
+// unchanged. This is Git's racy rule: a was read at a.read, and a write that
+// follows within the clock granularity of the previous modification leaves
+// the stat data as it was. So the stat data only proves that nothing
+// changed when the file was read more than racyWindow after its mtime.
 func (a fileSig) same(b fileSig) bool {
-	if a != b {
+	if !a.sameStat(b) {
 		return false
 	}
-	return !a.exists || time.Since(time.Unix(0, a.mtime)) > racyWindow
+	return !a.exists || a.read-a.mtime > int64(racyWindow)
 }
 
 func ignoreMissing(err error) error {
@@ -162,7 +177,7 @@ func (r *Repo) reloadPacks(force bool) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if p := old[name]; p != nil && p.sig == isig {
+		if p := old[name]; p != nil && p.sig.sameStat(isig) {
 			p.retain()
 			packs = append(packs, p)
 			continue
@@ -199,7 +214,12 @@ func (r *Repo) reloadPacks(force bool) (bool, error) {
 		for _, p := range packs {
 			p.release()
 		}
-		if cur.dirSig == dsig {
+		if cur.dirSig.sameStat(dsig) {
+			// The listing above was made after dsig was taken: record it, so
+			// that a directory that was racy when first read stops being
+			// rescanned once its window has passed. dirSig is only used
+			// with r.mu held.
+			cur.dirSig = dsig
 			return false, nil
 		}
 		packs = cur.packs

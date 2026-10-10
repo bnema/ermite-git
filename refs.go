@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -51,6 +52,7 @@ type packedRef struct {
 // packedRefs is an immutable parsed packed-refs file, sorted by name.
 type packedRefs struct {
 	sig  fileSig
+	raw  string // the file content: the names in refs point into it
 	refs []packedRef
 }
 
@@ -65,7 +67,8 @@ func (p *packedRefs) find(name string) (packedRef, bool) {
 }
 
 // loadPacked returns the current content of packed-refs, reparsing the file
-// when its stat data changed (or always with force).
+// when its stat data changed (or always with force). Concurrent callers share
+// one parse: the check is repeated once pmu is held.
 func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 	path := r.dir + "/packed-refs"
 	sig, err := statSig(path)
@@ -77,9 +80,17 @@ func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 	}
 	r.pmu.Lock()
 	defer r.pmu.Unlock()
+	cur := r.packed.Load()
+	if !force && cur != nil && (cur.sig.read > sig.read || cur.sig.same(sig)) {
+		// Another caller parsed the file while we waited for the lock. It read
+		// the file after we looked at it, so its result is at least as fresh
+		// as ours would be.
+		return cur, nil
+	}
+	read := time.Now().UnixNano()
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		p := &packedRefs{}
+		p := &packedRefs{sig: fileSig{read: read}}
 		r.packed.Store(p)
 		return p, nil
 	}
@@ -98,6 +109,13 @@ func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, err
 	}
+	if !force && cur != nil && cur.raw == string(data) {
+		// Racy stat data, same content (Git's racy rule): keep the parse
+		// and record that the file was read now.
+		p := &packedRefs{sig: sigOf(st, read), raw: cur.raw, refs: cur.refs}
+		r.packed.Store(p)
+		return p, nil
+	}
 	p, err := parsePackedRefs(string(data))
 	if err != nil {
 		return nil, err
@@ -107,7 +125,7 @@ func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 	}); i < len(p.refs) && strings.HasPrefix(p.refs[i].name, "refs/replace/") {
 		return nil, unsupported("replace refs (refs/replace in packed-refs)")
 	}
-	p.sig = sigOf(st)
+	p.sig = sigOf(st, read)
 	r.packed.Store(p)
 	return p, nil
 }
@@ -115,7 +133,7 @@ func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 // parsePackedRefs parses a packed-refs file. The ref names are substrings of
 // data.
 func parsePackedRefs(data string) (*packedRefs, error) {
-	p := &packedRefs{}
+	p := &packedRefs{raw: data}
 	fullyPeeled, peeled := false, false
 	first := true
 	for len(data) > 0 {
@@ -276,52 +294,100 @@ func validRootRef(name string) bool {
 // validRef accepts the names lookupRef may read.
 func validRef(name string) bool { return validRefName(name) || validRootRef(name) }
 
-// lookupRef resolves name through symbolic refs. loose refs win over packed
-// ones. The loose file is read before packed-refs, so a concurrent pack-refs
-// (which writes packed-refs first and deletes the loose file after) is never
-// missed.
-func (r *Repo) lookupRef(name string) (Ref, bool, error) {
+// refWalk is a ref lookup that went through the loose files and may still
+// need packed-refs.
+type refWalk struct {
+	ref  Ref
+	cur  string // the name to look up in packed-refs when !done
+	done bool   // the lookup is complete: ok tells whether it found a ref
+	ok   bool
+}
+
+// isRootRef reports whether name is a pseudo-ref of the Git directory
+// (HEAD, ORIG_HEAD...) rather than a name under refs/.
+func isRootRef(name string) bool { return !strings.HasPrefix(name, "refs/") }
+
+// lookupLoose follows name through the loose files and symbolic refs. It
+// stops at a loose ref that holds an id, or at the first name that has no
+// loose file: packed-refs decides about that one (see finish).
+func (r *Repo) lookupLoose(name string) (refWalk, error) {
 	if !validRef(name) {
-		return Ref{}, false, nil
+		return refWalk{done: true}, nil
 	}
-	ref := Ref{Name: name}
-	cur := name
+	w := refWalk{ref: Ref{Name: name}, cur: name}
 	for depth := 0; ; depth++ {
 		if depth > maxSymrefDepth {
-			return Ref{}, false, corrupt("ref %s: symbolic ref loop", name)
+			return refWalk{}, corrupt("ref %s: symbolic ref loop", name)
 		}
-		lr, found, err := r.readLooseRef(cur)
+		lr, found, err := r.readLooseRef(w.cur)
 		if err != nil {
-			return Ref{}, false, err
+			if errors.Is(err, ErrCorrupt) && isRootRef(w.cur) && w.cur != "HEAD" {
+				// A pseudo-ref such as FETCH_HEAD or MERGE_HEAD can hold
+				// anything (FETCH_HEAD has one line per fetched ref), and
+				// a revision like "ABCDEF" may name such a file by
+				// accident: it is not a ref, so not found. A broken HEAD
+				// stays an error.
+				return refWalk{done: true}, nil
+			}
+			return refWalk{}, err
 		}
 		if found && lr.symref != "" {
 			if depth == 0 {
-				ref.Symref = lr.symref
+				w.ref.Symref = lr.symref
 			}
 			if !validRef(lr.symref) {
-				return Ref{}, false, nil
+				return refWalk{done: true}, nil
 			}
-			cur = lr.symref
+			w.cur = lr.symref
 			continue
 		}
 		if found {
-			ref.ID = lr.id
-			return ref, true, nil
+			w.ref.ID = lr.id
+			w.done, w.ok = true, true
+			return w, nil
 		}
-		p, err := r.loadPacked(false)
-		if err != nil {
-			return Ref{}, false, err
-		}
-		e, ok := p.find(cur)
-		if !ok {
-			return Ref{}, false, nil
-		}
-		ref.ID = e.id
-		if depth == 0 {
-			ref.Peeled, ref.PeeledKnown = e.peeled, e.peeledKnown
-		}
-		return ref, true, nil
+		return w, nil
 	}
+}
+
+// finish completes a lookup with the content of packed-refs. The loose files
+// have to be read before packed-refs is loaded: a concurrent pack-refs writes
+// packed-refs first and deletes the loose file after, so it is never missed.
+func (w *refWalk) finish(p *packedRefs) (Ref, bool) {
+	if w.done {
+		return w.ref, w.ok
+	}
+	e, ok := p.find(w.cur)
+	if !ok {
+		return Ref{}, false
+	}
+	w.ref.ID = e.id
+	if w.cur == w.ref.Name {
+		w.ref.Peeled, w.ref.PeeledKnown = e.peeled, e.peeledKnown
+	}
+	return w.ref, true
+}
+
+// lookupRef resolves name through symbolic refs. loose refs win over packed
+// ones.
+func (r *Repo) lookupRef(name string) (Ref, bool, error) {
+	if r.snap.Load() == nil {
+		return Ref{}, false, ErrClosed
+	}
+	w, err := r.lookupLoose(name)
+	if err != nil {
+		return Ref{}, false, err
+	}
+	if w.done {
+		ref, ok := w.finish(nil)
+		return ref, ok, nil
+	}
+	p, err := r.loadPacked(false)
+	if err != nil {
+		return Ref{}, false, err
+	}
+	ref, ok := w.finish(p)
+	return ref, ok, nil
 }
 
 // ResolveRef returns the object the ref with this full name (such as
@@ -356,6 +422,9 @@ func (r *Repo) LookupRef(name string) (Ref, error) {
 // yet) is not an error: id is then the zero ObjectID. For a detached HEAD
 // target is empty and id is the commit.
 func (r *Repo) Head() (target string, id ObjectID, err error) {
+	if r.snap.Load() == nil {
+		return "", ObjectID{}, ErrClosed
+	}
 	lr, found, err := r.readLooseRef("HEAD")
 	if err != nil {
 		return "", ObjectID{}, err
@@ -397,7 +466,9 @@ func (r *Repo) Refs(prefix string) iter.Seq2[Ref, error] {
 }
 
 func (r *Repo) collectRefs(prefix string) ([]Ref, error) {
-	// Loose refs first, packed-refs after: see lookupRef.
+	if r.snap.Load() == nil {
+		return nil, ErrClosed
+	}
 	var dir string
 	switch {
 	case strings.HasPrefix(prefix, "refs/"):
@@ -407,15 +478,33 @@ func (r *Repo) collectRefs(prefix string) ([]Ref, error) {
 	default:
 		return nil, nil
 	}
+	// Loose refs first, packed-refs after: see refWalk.finish.
 	var loose []string
 	if err := r.walkLoose(dir, prefix, &loose, 0); err != nil {
 		return nil, err
 	}
+	slices.Sort(loose)
+	loose = slices.Compact(loose)
+	type item struct {
+		name string
+		w    refWalk
+	}
+	items := make([]item, 0, len(loose))
+	for _, n := range loose {
+		w, err := r.lookupLoose(n)
+		if err != nil {
+			if errors.Is(err, ErrCorrupt) {
+				continue // Git ignores broken refs when listing
+			}
+			return nil, err
+		}
+		items = append(items, item{name: n, w: w})
+	}
+	// One load of packed-refs serves every name.
 	p, err := r.loadPacked(false)
 	if err != nil {
 		return nil, err
 	}
-	names := loose
 	start, _ := slices.BinarySearchFunc(p.refs, prefix, func(e packedRef, pre string) int {
 		if strings.HasPrefix(e.name, pre) {
 			return 0
@@ -427,23 +516,25 @@ func (r *Repo) collectRefs(prefix string) ([]Ref, error) {
 	for start > 0 && strings.HasPrefix(p.refs[start-1].name, prefix) {
 		start--
 	}
+	nLoose := len(items)
 	for i := start; i < len(p.refs) && strings.HasPrefix(p.refs[i].name, prefix); i++ {
-		names = append(names, p.refs[i].name)
-	}
-	slices.Sort(names)
-	names = slices.Compact(names)
-
-	out := make([]Ref, 0, len(names))
-	for _, n := range names {
-		ref, ok, err := r.lookupRef(n)
-		if err != nil {
-			if errors.Is(err, ErrCorrupt) {
-				continue // Git ignores broken refs when listing
-			}
-			return nil, err
+		n := p.refs[i].name
+		if _, ok := slices.BinarySearch(loose, n); ok {
+			continue // the loose file wins; its walk is already in items
 		}
-		if ok {
-			ref.Name = n
+		if !validRef(n) {
+			continue
+		}
+		items = append(items, item{name: n, w: refWalk{ref: Ref{Name: n}, cur: n}})
+	}
+	if len(items) > nLoose {
+		slices.SortFunc(items, func(a, b item) int { return strings.Compare(a.name, b.name) })
+	}
+	out := make([]Ref, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		if ref, ok := it.w.finish(p); ok {
+			ref.Name = it.name
 			out = append(out, ref)
 		}
 	}
@@ -500,11 +591,25 @@ func (r *Repo) PeelRef(ref Ref) (ObjectID, error) {
 }
 
 // Resolve turns a revision name into an object id the way "git rev-parse"
-// does for plain names: a full 40 digit id, "HEAD", a full ref name, a short
-// ref name tried as "<n>", "refs/<n>", "refs/tags/<n>", "refs/heads/<n>",
-// "refs/remotes/<n>" and "refs/remotes/<n>/HEAD" in that order, and finally
-// an abbreviated id of 4 to 39 digits. Revision operators (~, ^, @{}) are not
-// supported. The result is not peeled; use PeelToCommit.
+// does for plain names. The result is not peeled; use PeelToCommit. Revision
+// operators (~, ^, @{}, :path) are not supported.
+//
+// The name is tried in git's order, and the first match wins:
+//
+//  1. a full 40 digit id. It is taken as an id even when a ref has that name
+//     (git warns that the ref is ambiguous and ignores it), and it must exist
+//     in the repository, which "git rev-parse" does not check;
+//  2. a ref, as "<n>", "refs/<n>", "refs/tags/<n>", "refs/heads/<n>",
+//     "refs/remotes/<n>" and "refs/remotes/<n>/HEAD", in that order. A tag
+//     therefore wins over a branch of the same name, whereas "git checkout"
+//     prefers the branch;
+//  3. an abbreviated id of 4 to 39 digits, which loses against any ref of
+//     that name. It matches any object, whatever its type, and fails with
+//     ErrAmbiguous if several do; see ResolveCommitPrefix.
+//
+// A caller that wants a branch or a tag, or a commit, should not use Resolve:
+// ResolveRef takes the full ref name and ResolveCommitPrefix only considers
+// commits. Resolve returns an error wrapping ErrNotFound if nothing matches.
 func (r *Repo) Resolve(rev string) (ObjectID, error) {
 	if rev == "" {
 		return ObjectID{}, notFound("empty revision")
