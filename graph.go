@@ -726,6 +726,26 @@ type graphFileStamp struct {
 // the chain file (layers are immutable and named by checksum).
 type graphStamp struct{ single, chain graphFileStamp }
 
+// trusted reports whether unchanged stat data proves that the files did not
+// change, for a stamp taken at the given time (unix nanoseconds). This is
+// Git's racy rule, the one of fileSig.same: a write that follows within the
+// clock granularity of the previous modification can leave the stat data as
+// it was, so the data only proves anything once the newest modification is
+// older than racyWindow when the stamp was taken. Git writes graph files by
+// rename, which already changes the inode; the rule covers the rest. The
+// time is that of the stamp, not of the last reload: measuring from the
+// reload would restart the window each time and reload a busy repository
+// forever.
+func (s graphStamp) trusted(at int64) bool {
+	newest := int64(math.MinInt64)
+	for _, f := range [...]graphFileStamp{s.single, s.chain} {
+		if f.exists {
+			newest = max(newest, f.mtime)
+		}
+	}
+	return newest == math.MinInt64 || at-newest > int64(racyWindow)
+}
+
 func statGraphFile(path string) graphFileStamp {
 	st, err := os.Stat(path)
 	if err != nil {

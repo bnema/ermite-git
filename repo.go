@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // Default bounds. See WithMaxObjectSize and WithDeltaCacheSize.
@@ -73,6 +74,16 @@ type Repo struct {
 
 	graph atomic.Pointer[graphState] // see walk.go
 	gmu   sync.Mutex                 // serializes commit-graph reloads
+
+	clock func() time.Time // tests only: time.Now when nil
+}
+
+// now is the time the racy-file rules measure from.
+func (r *Repo) now() time.Time {
+	if r.clock != nil {
+		return r.clock()
+	}
+	return time.Now()
 }
 
 // Open opens the repository whose Git directory is dir: a bare repository
