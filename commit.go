@@ -63,16 +63,25 @@ func (r *Repo) ReadCommit(id ObjectID, c *Commit) error {
 }
 
 // ParseCommit parses the content of a commit object into c. The fields of c
-// point into data, which must stay unchanged while they are used. It returns
-// ErrCorrupt if the commit has no valid tree or a malformed parent.
+// point into data, which must stay unchanged while they are used.
+//
+// It reads headers the way Git does: the first line must be the tree, the
+// parent lines are the ones that immediately follow it, and any tree or
+// parent line further down is an ordinary, ignored header. It returns
+// ErrCorrupt if the first line is not a valid tree or a parent is malformed.
 func ParseCommit(data []byte, c *Commit) error {
 	c.ID = ObjectID{}
 	c.Parents = c.Parents[:0]
 	c.Author, c.Committer = Signature{}, Signature{}
 	c.Encoding, c.Message = nil, nil
-	haveTree := false
+	const (
+		stTree = iota
+		stParents
+		stRest
+	)
+	state := stTree
 	for len(data) > 0 {
-		if data[0] == '\n' {
+		if data[0] == '\n' && state != stTree {
 			c.Message = data[1:]
 			break
 		}
@@ -82,23 +91,31 @@ func ParseCommit(data []byte, c *Commit) error {
 		} else {
 			line, data = data, nil
 		}
+		key, val, _ := bytes.Cut(line, []byte{' '})
+		switch state {
+		case stTree:
+			id, ok := parseIDBytes(val)
+			if string(key) != "tree" || !ok {
+				return corrupt("commit: the first header is not a valid tree")
+			}
+			c.Tree = id
+			state = stParents
+			continue
+		case stParents:
+			if string(key) == "parent" {
+				id, ok := parseIDBytes(val)
+				if !ok {
+					return corrupt("commit: bad parent header")
+				}
+				c.Parents = append(c.Parents, id)
+				continue
+			}
+			state = stRest
+		}
 		if line[0] == ' ' {
 			continue // continuation of a multi-line header such as gpgsig
 		}
-		key, val, _ := bytes.Cut(line, []byte{' '})
 		switch string(key) {
-		case "tree":
-			id, ok := parseIDBytes(val)
-			if !ok || haveTree {
-				return corrupt("commit: bad tree header")
-			}
-			c.Tree, haveTree = id, true
-		case "parent":
-			id, ok := parseIDBytes(val)
-			if !ok {
-				return corrupt("commit: bad parent header")
-			}
-			c.Parents = append(c.Parents, id)
 		case "author":
 			c.Author = parseSignature(val)
 		case "committer":
@@ -107,7 +124,7 @@ func ParseCommit(data []byte, c *Commit) error {
 			c.Encoding = val
 		}
 	}
-	if !haveTree {
+	if state == stTree {
 		return corrupt("commit: no tree")
 	}
 	return nil

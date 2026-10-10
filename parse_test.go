@@ -223,12 +223,15 @@ func TestParseCommitEdgeCases(t *testing.T) {
 		}
 	}
 	for name, d := range map[string]string{
-		"empty":       "",
-		"no tree":     "author A <a@x> 1 +0000\n\nmsg",
-		"bad tree":    "tree xyz\n\n",
-		"short tree":  "tree " + tree[:39] + "\n\n",
-		"bad parent":  "tree " + tree + "\nparent zz\n\n",
-		"double tree": "tree " + tree + "\ntree " + tree + "\n\n",
+		"empty":            "",
+		"no tree":          "author A <a@x> 1 +0000\n\nmsg",
+		"bad tree":         "tree xyz\n\n",
+		"short tree":       "tree " + tree[:39] + "\n\n",
+		"bad parent":       "tree " + tree + "\nparent zz\n\n",
+		"tree second":      "author A <a@x> 1 +0000\ntree " + tree + "\n\n",
+		"parent first":     "parent " + tree + "\ntree " + tree + "\n\n",
+		"blank first":      "\ntree " + tree + "\n",
+		"bad parent after": "tree " + tree + "\nparent " + tree + "\nparent x\n\n",
 	} {
 		if err := ParseCommit([]byte(d), &c); !errors.Is(err, ErrCorrupt) {
 			t.Errorf("%s: %v", name, err)

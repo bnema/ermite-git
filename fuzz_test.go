@@ -93,6 +93,9 @@ func FuzzParseCommit(f *testing.F) {
 	f.Add([]byte("tree " + tree))
 	f.Add([]byte("tree " + tree + "\nauthor <> 99999999999999999999999 +9999\n\n"))
 	f.Add([]byte("tree\n\n"))
+	f.Add([]byte("tree " + tree + "\ntree " + par + "\nparent " + par + "\n\n"))
+	f.Add([]byte("tree " + tree + "\nparent " + par + "\nauthor A <a@x> 1 +0000\nparent " + tree + "\n\nm"))
+	f.Add([]byte("parent " + par + "\ntree " + tree + "\n\n"))
 	f.Add([]byte{})
 	f.Add([]byte("\n\n\n"))
 	var c Commit
@@ -101,6 +104,20 @@ func FuzzParseCommit(f *testing.F) {
 		okOrCorrupt(t, err)
 		if err == nil && len(c.Message) > len(data) {
 			t.Fatal("message longer than input")
+		}
+		if err == nil && !bytes.HasPrefix(data, []byte("tree ")) {
+			t.Fatal("accepted a commit whose first header is not the tree")
+		}
+		if err == nil && len(c.Parents) > 0 {
+			// The parents are the lines that follow the tree directly.
+			rest := data[bytes.IndexByte(data, '\n')+1:]
+			for _, p := range c.Parents {
+				want := append([]byte("parent "), []byte(p.String())...)
+				if len(rest) < len(want) || !bytes.EqualFold(rest[:len(want)], want) {
+					t.Fatalf("parent %s is not on the line after the tree", p)
+				}
+				rest = rest[bytes.IndexByte(rest, '\n')+1:]
+			}
 		}
 		var tg Tag
 		okOrCorrupt(t, ParseTag(data, &tg))
