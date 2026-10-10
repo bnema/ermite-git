@@ -2,7 +2,7 @@
 
 A fast, read-only Git repository reader for Go: refs, objects, packfiles, trees and history, using commit-graph and changed-path Bloom filters. Standard library only.
 
-Status: early development, no stable API. Phase A (this tree) reads refs, loose and packed objects, trees, blobs and commits; history walks come next.
+Status: early development, no stable API. Phase A reads refs, loose and packed objects, trees, blobs and commits; phase B adds the commit-graph, changed-path Bloom filters and history walks.
 
 ```go
 import git "bnema.dev/ermite-git"
@@ -22,6 +22,19 @@ _ = repo.ReadTree(c.Tree, func(e git.Entry) bool {
 	fmt.Printf("%s %s\n", e.Mode, e.Name) // e.Name is valid during the callback only
 	return true
 })
+```
+
+History in the order of `git log`, with the same path simplification as `git log -- path`:
+
+```go
+for c, err := range repo.Walk(ctx, commitID, git.WalkOptions{Path: "pkg/gui", Skip: 100, Limit: 50}) {
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", c.ID) // c is reused: valid until the next iteration
+}
+// the last commit of every entry of a directory, in one walk
+ids, err := repo.LastCommits(ctx, commitID, "pkg", []string{"gui", "commands"})
 ```
 
 A `Repo` is safe for concurrent use. Call `Refresh` after the repository changed (a push, a repack) to see new refs and packs; reads in flight keep working while packs are replaced.

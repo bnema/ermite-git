@@ -91,7 +91,16 @@ type lookupKey struct {
 	level uint16
 }
 
-const maxLookupCache = 1 << 14
+// lookupSlots is the size of the direct-mapped cache of lookups. A walk
+// along a chain asks again for the trees it has just read, so a small table
+// is enough, and it never allocates after it is created.
+const lookupSlots = 256
+
+type lookupSlot struct {
+	key lookupKey
+	e   pathEntry
+	ok  bool
+}
 
 // pathDiffer answers TREESAME questions for one path. It is not safe for
 // concurrent use.
@@ -100,13 +109,13 @@ type pathDiffer struct {
 	comps   []string
 	dirOnly bool
 	names   [][]byte
-	cache   map[lookupKey]pathEntry
+	cache   []lookupSlot // allocated on first use
 	buf     []byte
 }
 
 func newPathDiffer(r *Repo, spec pathSpec) *pathDiffer {
 	comps := spec.comps
-	d := &pathDiffer{r: r, comps: comps, dirOnly: spec.dirOnly, cache: make(map[lookupKey]pathEntry, 256)}
+	d := &pathDiffer{r: r, comps: comps, dirOnly: spec.dirOnly}
 	d.names = make([][]byte, len(comps))
 	for i, c := range comps {
 		d.names[i] = []byte(c)
@@ -120,8 +129,12 @@ func (d *pathDiffer) lookup(tree ObjectID, level int) (pathEntry, error) {
 		return pathEntry{}, nil
 	}
 	k := lookupKey{tree, uint16(level)}
-	if e, ok := d.cache[k]; ok {
-		return e, nil
+	if d.cache == nil {
+		d.cache = make([]lookupSlot, lookupSlots)
+	}
+	slot := &d.cache[(uint(tree[0])|uint(tree[1])<<8+uint(level))%lookupSlots]
+	if slot.ok && slot.key == k {
+		return slot.e, nil
 	}
 	typ, data, err := d.r.ReadObject(tree, d.buf)
 	if err != nil {
@@ -135,10 +148,7 @@ func (d *pathDiffer) lookup(tree ObjectID, level int) (pathEntry, error) {
 	if err != nil {
 		return pathEntry{}, wrapObj(tree, err)
 	}
-	if len(d.cache) >= maxLookupCache {
-		clear(d.cache)
-	}
-	d.cache[k] = e
+	*slot = lookupSlot{key: k, e: e, ok: true}
 	return e, nil
 }
 

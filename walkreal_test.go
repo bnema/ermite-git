@@ -174,10 +174,7 @@ func TestLastCommitsRealRepository(t *testing.T) {
 		if dir != "" {
 			spec += ":" + dir
 		}
-		var names []string
-		for _, l := range lines(x.git(t, "ls-tree", "--name-only", spec)) {
-			names = append(names, l)
-		}
+		names := lines(x.git(t, "ls-tree", "--name-only", spec))
 		if len(names) > 120 {
 			names = names[:120]
 		}

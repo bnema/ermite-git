@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unsafe"
 )
 
 // LastCommits finds, in one walk, the last commit that touched each entry of
@@ -75,8 +76,8 @@ func (r *Repo) LastCommits(ctx context.Context, start ObjectID, dir string, name
 		s.key = newBloomKey([]byte(spec.String()))
 		s.useBloom = s.key.usable
 	}
-	s.maxTrees = max(64, (16<<20)/(len(uniq)*28+64))
-	s.cache = make(map[ObjectID][]pathEntry, 256)
+	// The cache holds at most about 1 MiB of entries, 16 trees at least.
+	s.slots = min(256, max(16, (1<<20)/(len(uniq)*int(unsafe.Sizeof(pathEntry{})))))
 	s.absent = make([]pathEntry, len(uniq))
 	if err := s.run(); err != nil {
 		return nil, err
@@ -118,13 +119,22 @@ type lastState struct {
 	found     []ObjectID
 	remaining int
 
-	cache    map[ObjectID][]pathEntry // entries of the names, by directory tree
-	maxTrees int
-	absent   []pathEntry // all names missing
-	buf      []byte
+	// A cache of the entries of the names in directory trees, 4-way
+	// associative, backed by one slab so that it never allocates per tree.
+	slots  int
+	cache  []entrySlot
+	slab   []pathEntry
+	tick   uint64      // counts steps; the slots used by the current step are kept
+	absent []pathEntry // all names missing
+	buf    []byte
 
 	// scratch
 	ks []int8
+}
+
+type entrySlot struct {
+	tree ObjectID
+	used uint64 // step that last used the slot, 0 when empty
 }
 
 // dirOf finds the directory in a root tree.
@@ -145,8 +155,23 @@ func (s *lastState) entries(dir ObjectID, ok bool) ([]pathEntry, error) {
 	if !ok || dir == emptyTreeID {
 		return s.absent, nil
 	}
-	if e, hit := s.cache[dir]; hit {
-		return e, nil
+	if s.cache == nil {
+		s.cache = make([]entrySlot, s.slots)
+		s.slab = make([]pathEntry, s.slots*s.n)
+	}
+	base := (int(dir[0]) | int(dir[1])<<8) % s.slots
+	victim := -1
+	for j := 0; j < 4 && j < s.slots; j++ {
+		k := (base + j) % s.slots
+		c := &s.cache[k]
+		if c.used != 0 && c.tree == dir {
+			c.used = s.tick
+			return s.slab[k*s.n : (k+1)*s.n], nil
+		}
+		// Slots used by this step still back slices in use: keep them.
+		if c.used != s.tick && (victim < 0 || c.used < s.cache[victim].used) {
+			victim = k
+		}
 	}
 	typ, data, err := s.w.r.ReadObject(dir, s.buf)
 	if err != nil {
@@ -156,7 +181,13 @@ func (s *lastState) entries(dir ObjectID, ok bool) ([]pathEntry, error) {
 	if typ != TypeTree {
 		return nil, wrongType(dir, typ, TypeTree)
 	}
-	ents := make([]pathEntry, s.n)
+	var ents []pathEntry
+	if victim >= 0 {
+		ents = s.slab[victim*s.n : (victim+1)*s.n]
+		clear(ents)
+	} else {
+		ents = make([]pathEntry, s.n) // every slot is in use by this step
+	}
 	if err := ParseTree(data, func(e Entry) bool {
 		if i, hit := s.idx[string(e.Name)]; hit {
 			ents[i] = pathEntry{id: e.ID, mode: e.Mode, found: true}
@@ -165,10 +196,9 @@ func (s *lastState) entries(dir ObjectID, ok bool) ([]pathEntry, error) {
 	}); err != nil {
 		return nil, wrapObj(dir, err)
 	}
-	if len(s.cache) >= s.maxTrees {
-		clear(s.cache)
+	if victim >= 0 {
+		s.cache[victim] = entrySlot{tree: dir, used: s.tick}
 	}
-	s.cache[dir] = ents
 	return ents, nil
 }
 
@@ -202,6 +232,7 @@ func (s *lastState) run() error {
 // off from g.
 func (s *lastState) step(g *lastGroup) ([]*lastGroup, error) {
 	w := s.w
+	s.tick++
 	n := g.pop().n
 	tree, parents, err := w.load(n, w.parents[:0])
 	w.parents = parents
@@ -294,6 +325,17 @@ func (s *lastState) step(g *lastGroup) ([]*lastGroup, error) {
 	g.active = live
 	if len(live) == 0 {
 		return nil, nil
+	}
+	// All the names follow the same parent: no split.
+	same := true
+	for _, i := range live[1:] {
+		if ks[i] != ks[live[0]] {
+			same = false
+			break
+		}
+	}
+	if same {
+		return nil, s.follow(g, parents[ks[live[0]]])
 	}
 	// Split the group by the parent each remaining name follows.
 	var extra []*lastGroup
