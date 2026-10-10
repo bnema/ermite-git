@@ -484,6 +484,7 @@ func BenchmarkReadObjectSequence(b *testing.B) {
 
 func TestMain(m *testing.M) {
 	code := m.Run()
+	cleanupRealWalk()
 	if benchFx != nil && benchFx.r != nil {
 		_ = benchFx.r.Close()
 		if os.Getenv("ERMITE_GIT_BENCH_REPO") == "" {
