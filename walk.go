@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -94,15 +96,25 @@ type qent struct {
 	n    node
 }
 
+// walkState is the part of a walk that decides its order: the queue of
+// commits to visit and the set of those already queued.
+type walkState struct {
+	q    []qent
+	seq  uint64
+	seen seenSet
+}
+
+func (s *walkState) clone() walkState {
+	return walkState{q: slices.Clone(s.q), seq: s.seq, seen: s.seen.clone()}
+}
+
 type walker struct {
 	r    *Repo
 	g    *commitGraph // retained, may be nil
 	ctx  context.Context
 	opts WalkOptions
 
-	q    []qent
-	seq  uint64
-	seen seenSet
+	walkState
 
 	path *pathDiffer // nil without a path
 	key  bloomKey
@@ -358,7 +370,7 @@ func (w *walker) fill(n node) (*Commit, error) {
 }
 
 // push adds a commit to the queue.
-func (w *walker) push(t int64, n node) {
+func (w *walkState) push(t int64, n node) {
 	w.seq++
 	w.q = append(w.q, qent{time: t, seq: w.seq, n: n})
 	i := len(w.q) - 1
@@ -373,7 +385,7 @@ func (w *walker) push(t int64, n node) {
 }
 
 // pop removes the first commit of the queue.
-func (w *walker) pop() qent {
+func (w *walkState) pop() qent {
 	top := w.q[0]
 	last := len(w.q) - 1
 	w.q[0] = w.q[last]
@@ -417,6 +429,14 @@ func (s *seenSet) init(g *commitGraph) {
 	if g != nil {
 		s.bits = make([]uint64, (uint64(g.numCommits())+63)/64)
 	}
+}
+
+func (s *seenSet) clone() seenSet {
+	c := seenSet{bits: slices.Clone(s.bits)}
+	if s.ids != nil {
+		c.ids = maps.Clone(s.ids)
+	}
+	return c
 }
 
 // add marks n and reports whether it was not marked yet.
