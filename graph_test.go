@@ -33,13 +33,6 @@ func graphTestHex(s string) oid {
 
 // ---- git fixtures ---------------------------------------------------------
 
-func requireGit(t testing.TB) {
-	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git binary not available")
-	}
-}
-
 func graphGitEnv(date int64) []string {
 	env := append(os.Environ(),
 		"GIT_CONFIG_GLOBAL=/dev/null",
