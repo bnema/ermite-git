@@ -511,7 +511,11 @@ func (r *Repo) Resolve(rev string) (ObjectID, error) {
 	}
 	if len(rev) == 40 {
 		if id, err := ParseID(rev); err == nil {
-			if !r.HasObject(id) {
+			ok, err := r.HasObject(id)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			if !ok {
 				return ObjectID{}, notFound("object %s", id)
 			}
 			return id, nil

@@ -26,48 +26,63 @@ func (f *finder) close() { f.s.release() }
 
 func (f *finder) pack(id *ObjectID) (*pack, uint64, error) { return f.s.find(id) }
 
+// reloadPacksHook, when set by a test, replaces the reload done by again.
+var reloadPacksHook func(r *Repo) (bool, error)
+
 // again reloads the pack list if it changed and reports whether the lookup
 // is worth repeating, that is whether the current snapshot differs from the
 // one this finder used. Another goroutine may already have installed the new
 // list, so the answer of reloadPacks alone is not enough. It returns true at
-// most once.
-func (f *finder) again() bool {
+// most once. An error from the reload is returned: the object may well exist
+// in a pack that could not be listed, so "not found" would be a wrong answer.
+func (f *finder) again() (bool, error) {
 	if f.retried {
-		return false
+		return false, nil
 	}
 	f.retried = true
-	if _, err := f.r.reloadPacks(false); err != nil {
-		return false
+	reload := f.r.reloadPacks
+	if hook := reloadPacksHook; hook != nil {
+		reload = func(bool) (bool, error) { return hook(f.r) }
+	}
+	if _, err := reload(false); err != nil {
+		return false, err
 	}
 	s, err := f.r.acquire()
 	if err != nil {
-		return false
+		return false, err
 	}
 	if s == f.s {
 		s.release()
-		return false
+		return false, nil
 	}
 	f.s.release()
 	f.s = s
-	return true
+	return true, nil
 }
 
-// HasObject reports whether the object exists.
-func (r *Repo) HasObject(id ObjectID) bool {
+// HasObject reports whether the object exists. The error is not nil when the
+// answer is unknown: the repository is closed, or the pack list could not be
+// reloaded while the object was missing from the current one (during a gc,
+// for example).
+func (r *Repo) HasObject(id ObjectID) (bool, error) {
 	f, err := r.finder()
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer f.close()
 	for {
 		if p, _, err := f.pack(&id); err != nil || p != nil {
-			return err == nil
+			return err == nil, err
 		}
 		if exists(r.loosePath(&id)) {
-			return true
+			return true, nil
 		}
-		if !f.again() {
-			return false
+		again, err := f.again()
+		if err != nil {
+			return false, err
+		}
+		if !again {
+			return false, nil
 		}
 	}
 }
@@ -100,7 +115,9 @@ func (r *Repo) ObjectHeader(id ObjectID) (Type, int64, error) {
 		if !errors.Is(err, ErrNotFound) {
 			return 0, 0, err
 		}
-		if !f.again() {
+		if again, err := f.again(); err != nil {
+			return 0, 0, err
+		} else if !again {
 			return 0, 0, notFound("object %s", id.String())
 		}
 	}
@@ -134,7 +151,9 @@ func (r *Repo) ReadObject(id ObjectID, dst []byte) (Type, []byte, error) {
 		if !errors.Is(err, ErrNotFound) {
 			return 0, nil, err
 		}
-		if !f.again() {
+		if again, err := f.again(); err != nil {
+			return 0, nil, err
+		} else if !again {
 			return 0, nil, notFound("object %s", id.String())
 		}
 	}
@@ -216,13 +235,16 @@ func (r *Repo) ResolvePrefix(hex string) (ObjectID, error) {
 // that designate a commit: commits and tags that peel to a commit. It is what
 // "git rev-parse <hex>^{commit}" does.
 func (r *Repo) ResolveCommitPrefix(hex string) (ObjectID, error) {
-	return r.resolvePrefix(hex, func(id ObjectID) bool {
+	return r.resolvePrefix(hex, func(id ObjectID) (bool, error) {
 		_, err := r.PeelToCommit(id)
-		return err == nil
+		if errors.Is(err, ErrWrongType) {
+			return false, nil
+		}
+		return err == nil, err
 	})
 }
 
-func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) bool) (ObjectID, error) {
+func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) (bool, error)) (ObjectID, error) {
 	n := len(hex)
 	if n < minPrefix || n > 40 {
 		return ObjectID{}, fmt.Errorf("%w: %q must have %d to 40 hexadecimal digits", ErrInvalidID, truncate(hex), minPrefix)
@@ -249,6 +271,7 @@ func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) bool) (ObjectID, 
 	for {
 		var found [2]ObjectID
 		count := 0
+		var acceptErr error
 		add := func(id ObjectID) bool {
 			if count > 0 && found[0] == id {
 				return true
@@ -256,8 +279,15 @@ func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) bool) (ObjectID, 
 			if count > 1 && found[1] == id {
 				return true
 			}
-			if accept != nil && !accept(id) {
-				return true
+			if accept != nil {
+				ok, err := accept(id)
+				if err != nil {
+					acceptErr = err
+					return false
+				}
+				if !ok {
+					return true
+				}
 			}
 			found[count] = id
 			count++
@@ -269,10 +299,13 @@ func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) bool) (ObjectID, 
 				break
 			}
 		}
-		if count < 2 {
+		if count < 2 && acceptErr == nil {
 			if err := r.looseWithPrefix(hex, add); err != nil {
 				return ObjectID{}, err
 			}
+		}
+		if acceptErr != nil {
+			return ObjectID{}, acceptErr
 		}
 		switch {
 		case count >= 2:
@@ -280,7 +313,9 @@ func (r *Repo) resolvePrefix(hex string, accept func(ObjectID) bool) (ObjectID, 
 		case count == 1:
 			return found[0], nil
 		}
-		if !f.again() {
+		if again, err := f.again(); err != nil {
+			return ObjectID{}, err
+		} else if !again {
 			return ObjectID{}, notFound("no object starts with %s", hex)
 		}
 	}

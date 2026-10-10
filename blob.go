@@ -40,7 +40,9 @@ func (r *Repo) OpenBlob(id ObjectID) (int64, io.ReadCloser, error) {
 		if !errors.Is(err, ErrNotFound) {
 			return 0, nil, err
 		}
-		if !f.again() {
+		if again, err := f.again(); err != nil {
+			return 0, nil, err
+		} else if !again {
 			return 0, nil, notFound("object %s", id)
 		}
 	}
