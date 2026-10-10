@@ -29,6 +29,8 @@ type pack struct {
 	sig   fileSig
 	unmap [2]func() error
 	refs  atomic.Int32
+
+	hdrs atomic.Pointer[headerCache] // created by the first deltified header
 }
 
 func (p *pack) retain() { p.refs.Add(1) }
@@ -253,40 +255,65 @@ func (p *pack) baseOffset(h *entryHdr, self uint64) (uint64, error) {
 	return off, nil
 }
 
-// header returns the type and size of the object at off.
+// header returns the type and size of the object at off. The result of a
+// deltified object, which costs an inflate to find, is cached per pack.
 func (p *pack) header(off uint64) (Type, int64, error) {
+	hc := p.hdrs.Load()
+	if hc != nil {
+		if typ, size, ok := hc.get(off); ok {
+			return typ, size, nil
+		}
+	}
+	typ, size, deltified, err := p.readHeader(off)
+	if err != nil || !deltified {
+		return typ, size, err
+	}
+	if hc == nil {
+		hc = newHeaderCache(p.idx.n)
+		if !p.hdrs.CompareAndSwap(nil, hc) {
+			hc = p.hdrs.Load()
+		}
+	}
+	hc.put(off, typ, size)
+	return typ, size, nil
+}
+
+// readHeader reads the type and size of the object at off from the pack.
+// deltified tells that the size comes from the start of a delta, which it
+// had to inflate.
+func (p *pack) readHeader(off uint64) (_ Type, _ int64, deltified bool, _ error) {
 	h, err := parseEntryHeader(p.data, off)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	if !h.isDelta() {
 		if h.size > 1<<62 {
-			return 0, 0, corrupt("entry size %d", h.size)
+			return 0, 0, false, corrupt("entry size %d", h.size)
 		}
-		return Type(h.typ), int64(h.size), nil
+		return Type(h.typ), int64(h.size), false, nil
 	}
 	typ, err := p.chainEnd(off, h)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	// The result size is the second varint of the delta, at its start.
 	m, err := getMem(p.stream(&h))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	defer putMem(m)
 	n := min(uint64(len(m.scratch)), h.size)
 	if _, err := io.ReadFull(&m.zr, m.scratch[:n]); err != nil {
-		return 0, 0, corrupt("delta header: %v", err)
+		return 0, 0, false, corrupt("delta header: %v", err)
 	}
 	_, rs, _, err := deltaHeader(m.scratch[:n])
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	if rs > 1<<62 {
-		return 0, 0, corrupt("delta result size %d", rs)
+		return 0, 0, false, corrupt("delta result size %d", rs)
 	}
-	return typ, int64(rs), nil
+	return typ, int64(rs), true, nil
 }
 
 // readPacked resolves the object at off into dst (grown as needed) and
