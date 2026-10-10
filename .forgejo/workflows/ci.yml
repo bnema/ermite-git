@@ -26,13 +26,27 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # The conformance tests compare with git >= 2.45 (git 2.39 of ubuntu-latest
+    # peels nested tags and writes Bloom filters differently). The arch label runs
+    # archlinux:latest as root, with a current git.
+    runs-on: arch
     steps:
+      - name: System packages
+        run: pacman -Syu --noconfirm --needed git gcc
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Git is at least 2.45
+        run: |
+          git --version
+          v=$(git --version | sed -E 's/^git version ([0-9]+)\.([0-9]+).*/\1 \2/')
+          set -- $v
+          if [ "$1" -lt 2 ] || { [ "$1" -eq 2 ] && [ "$2" -lt 45 ]; }; then
+            echo "git 2.45 or newer is required" >&2
+            exit 1
+          fi
       - name: Verify tidy
         run: |
           go mod tidy

@@ -49,6 +49,8 @@ Repositories the package does not read are rejected by `Open` with `ErrUnsupport
 
 ## Test
 
+The conformance tests compare with the `git` binary, 2.45 or newer (they are skipped without git).
+
 ```sh
 go test -race ./...
 # also compare every object of a real repository with `git cat-file`:
