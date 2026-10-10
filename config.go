@@ -79,8 +79,11 @@ func checkConfigData(data []byte) error {
 				if !strings.EqualFold(val, "files") {
 					return unsupported("extensions.refstorage = %s", truncate(val))
 				}
-			case "noop", "worktreeconfig":
-				// No effect on reading a bare repository.
+			case "noop", "worktreeconfig", "preciousobjects", "relativeworktrees":
+				// No effect on reading: preciousobjects only forbids
+				// deleting objects, relativeworktrees changes how linked
+				// worktrees point at the repository (they are rejected
+				// anyway).
 			default:
 				return unsupported("extensions.%s", truncate(key))
 			}

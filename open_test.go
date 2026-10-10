@@ -17,6 +17,8 @@ func TestConfigChecks(t *testing.T) {
 		"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha1\n\trefstorage = files\n",
 		"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tObjectFormat = SHA1 # comment\n",
 		"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tnoop = true\n\tworktreeConfig = true\n",
+		"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tpreciousObjects = true\n\tRelativeWorktrees = true\n",
+		"[core]\n\trepositoryformatversion = 1\n[EXTENSIONS]\n\tPRECIOUSOBJECTS = true\n\trelativeworktrees = true\n",
 		"[remote \"origin\"]\n\turl = x\n[extensions-lookalike]\n\tfoo = bar\n",
 		"# comment\n; comment\n[core]\nrepositoryformatversion=0\n",
 		"[branch \"extensions\"]\n\tobjectformat = sha256\n",
