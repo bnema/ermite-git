@@ -314,7 +314,7 @@ func (s *lastState) step(g *lastGroup) ([]*lastGroup, error) {
 			g.active = part
 			continue
 		}
-		ng := &lastGroup{walkState: g.walkState.clone(), active: part}
+		ng := &lastGroup{walkState: g.clone(), active: part}
 		if err := s.follow(ng, parents[pi]); err != nil {
 			return nil, err
 		}
