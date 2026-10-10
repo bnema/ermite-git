@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//go:build linux || darwin || freebsd
+//go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly
 
 package git
 

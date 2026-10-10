@@ -41,6 +41,12 @@ A `Repo` is safe for concurrent use. Call `Refresh` after the repository changed
 
 Repositories the package does not read are rejected by `Open` with `ErrUnsupported`: SHA-256, reftable, other `extensions.*`, shallow, grafts, replace refs, alternates, partial clones, incremental or stale multi-pack-index.
 
+## Limits
+
+- **A pack truncated in place can crash the process.** Packs and indexes are memory-mapped; if another process shrinks one of them while it is mapped, a read of the missing part ends with SIGBUS, which Go cannot recover from. Git always replaces a pack by renaming a new file over it (repack, gc, fetch), and a mapping keeps the old file alive, so this takes an external actor that edits packs in place, or a failing disk. Not handled.
+- **Without mmap, packs are read into memory.** Linux, macOS, FreeBSD, OpenBSD, NetBSD and DragonFly map packs. On Windows and other systems the whole `.pack` and `.idx` are read into memory when a pack is opened, so memory grows with the size of the repository. Not handled.
+- **Revision names.** `Resolve` follows `git rev-parse` for plain names: a tag wins over a branch of the same name, and a full 40 digit id is never read as a ref. Use `ResolveRef` for a full ref name and `ResolveCommitPrefix` for an abbreviation that must designate a commit.
+
 ## Test
 
 ```sh
