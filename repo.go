@@ -4,11 +4,14 @@ package git
 
 import (
 	"errors"
+	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 // Default bounds. See WithMaxObjectSize and WithDeltaCacheSize.
@@ -31,11 +34,12 @@ type Option func(*options)
 // WithMaxObjectSize bounds the size of an object that is held in memory:
 // commits, trees, tags and blobs that are stored as deltas. Bigger ones fail
 // with ErrTooLarge. Undeltified blobs stream and are not bounded. The default
-// is 128 MiB.
+// is 128 MiB. The bound is capped at the largest int of the platform
+// (2 GiB - 1 on 32-bit systems), since such an object must fit in a slice.
 func WithMaxObjectSize(n int64) Option {
 	return func(o *options) {
 		if n > 0 {
-			o.maxObject = n
+			o.maxObject = min(n, math.MaxInt)
 		}
 	}
 }
@@ -176,6 +180,12 @@ func isGitDir(dir string) bool {
 	return true
 }
 
+// isNotExist reports whether err means that a path, or a directory on the way
+// to it, is absent.
+func isNotExist(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
 func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
@@ -195,17 +205,19 @@ func checkLayout(dir string) error {
 		}
 	}
 	f, err := os.Open(filepath.Join(dir, "refs", "replace"))
-	if err == nil {
-		names, rerr := f.Readdirnames(1)
-		_ = f.Close()
-		if rerr == nil && len(names) > 0 {
-			return unsupported("replace refs (refs/replace)")
+	if err != nil {
+		if isNotExist(err) {
+			return nil
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, fs.ErrInvalid) {
-		var pe *fs.PathError
-		if !errors.As(err, &pe) {
-			return err
-		}
+		return err
 	}
-	return nil
+	names, rerr := f.Readdirnames(1)
+	_ = f.Close()
+	switch {
+	case rerr == nil && len(names) > 0:
+		return unsupported("replace refs (refs/replace)")
+	case rerr == nil, errors.Is(rerr, io.EOF), isNotExist(rerr):
+		return nil
+	}
+	return rerr
 }

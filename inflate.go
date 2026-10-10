@@ -8,6 +8,7 @@ import (
 	"compress/zlib"
 	"errors"
 	"io"
+	"math"
 	"sync"
 )
 
@@ -37,7 +38,13 @@ func grow(b []byte, n int) []byte {
 	if cap(b) >= n {
 		return b[:n]
 	}
-	return make([]byte, n, n+n/4)
+	// Spare room for the next, slightly bigger object; n+n/4 may overflow
+	// an int on 32-bit systems, where the size is capped at MaxInt.
+	c := n
+	if n <= math.MaxInt-n/4 {
+		c = n + n/4
+	}
+	return make([]byte, n, c)
 }
 
 // memInflater inflates a zlib stream held in memory.
