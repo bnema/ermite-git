@@ -209,7 +209,7 @@ func (p *pack) inflateEntry(h *entryHdr, dst []byte) error {
 		return err
 	}
 	defer putMem(m)
-	return inflateExact(m.zr, dst, m.scratch[:])
+	return inflateExact(&m.zr, dst, m.scratch[:])
 }
 
 // chainEnd follows the chain of delta headers from off without inflating
@@ -276,7 +276,7 @@ func (p *pack) header(off uint64) (Type, int64, error) {
 	}
 	defer putMem(m)
 	n := min(uint64(len(m.scratch)), h.size)
-	if _, err := io.ReadFull(m.zr, m.scratch[:n]); err != nil {
+	if _, err := io.ReadFull(&m.zr, m.scratch[:n]); err != nil {
 		return 0, 0, corrupt("delta header: %v", err)
 	}
 	_, rs, _, err := deltaHeader(m.scratch[:n])

@@ -5,8 +5,11 @@ package git
 import (
 	"bufio"
 	"bytes"
-	"compress/zlib"
+	"compress/flate"
+	"encoding/binary"
 	"errors"
+	"hash"
+	"hash/adler32"
 	"io"
 	"math"
 	"sync"
@@ -47,9 +50,95 @@ func grow(b []byte, n int) []byte {
 	return make([]byte, n, c)
 }
 
+// Errors of the zlib wrapper. Callers wrap them in ErrCorrupt.
+var (
+	errZlibHeader   = errors.New("zlib: invalid header")
+	errZlibDict     = errors.New("zlib: preset dictionary")
+	errZlibChecksum = errors.New("zlib: invalid checksum")
+)
+
+// zlibReader inflates a zlib stream (RFC 1950). It is compress/zlib's reader
+// without its allocation per Reset: Go's zlib.Reader.Reset calls
+// adler32.New() each time, while here the checksum state and the flate
+// decompressor are both created once and reset. The adler32 trailer is
+// verified when the deflate stream ends; it is the only check of the
+// inflated content, since neither the pack trailer nor the idx CRCs are
+// verified.
+//
+// A zlibReader is not safe for concurrent use.
+type zlibReader struct {
+	src  flate.Reader
+	fl   io.ReadCloser // *flate decompressor, created at the first Reset
+	rs   flate.Resetter
+	sum  hash.Hash32
+	err  error // sticky; io.EOF once the stream and its checksum are verified
+	tail [4]byte
+}
+
+// Reset starts reading the zlib stream at the current position of src. It
+// reads the 2-byte header: deflate with a window of at most 32 KiB, a valid
+// check value, no preset dictionary (Git never writes one).
+func (z *zlibReader) Reset(src flate.Reader) error {
+	z.src, z.err = src, nil
+	cmf, err := src.ReadByte()
+	if err == nil {
+		var flg byte
+		if flg, err = src.ReadByte(); err == nil {
+			switch {
+			case cmf&0x0f != 8 || cmf>>4 > 7 || (uint(cmf)<<8|uint(flg))%31 != 0:
+				err = errZlibHeader
+			case flg&0x20 != 0:
+				err = errZlibDict
+			}
+		}
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		z.err = err
+		return err
+	}
+	if z.fl == nil {
+		z.fl = flate.NewReader(src)
+		z.rs = z.fl.(flate.Resetter)
+		z.sum = adler32.New()
+	} else {
+		_ = z.rs.Reset(src, nil) // never fails without a dictionary
+		z.sum.Reset()
+	}
+	return nil
+}
+
+func (z *zlibReader) Read(p []byte) (int, error) {
+	if z.err != nil {
+		return 0, z.err
+	}
+	n, err := z.fl.Read(p)
+	_, _ = z.sum.Write(p[:n]) // never fails
+	if err != io.EOF {
+		z.err = err
+		return n, err
+	}
+	// End of the deflate stream: the big-endian adler32 of the content.
+	if _, err := io.ReadFull(z.src, z.tail[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		z.err = err
+		return n, err
+	}
+	if binary.BigEndian.Uint32(z.tail[:]) != z.sum.Sum32() {
+		z.err = errZlibChecksum
+		return n, z.err
+	}
+	z.err = io.EOF
+	return n, io.EOF
+}
+
 // memInflater inflates a zlib stream held in memory.
 type memInflater struct {
-	zr      io.ReadCloser
+	zr      zlibReader
 	br      bytes.Reader
 	scratch [maxLooseHeader]byte // for reads through the io.Reader interface, which escape
 }
@@ -60,13 +149,7 @@ var memPool = sync.Pool{New: func() any { return new(memInflater) }}
 func getMem(src []byte) (*memInflater, error) {
 	m := memPool.Get().(*memInflater)
 	m.br.Reset(src)
-	var err error
-	if m.zr == nil {
-		m.zr, err = zlib.NewReader(&m.br)
-	} else {
-		err = m.zr.(zlib.Resetter).Reset(&m.br, nil)
-	}
-	if err != nil {
+	if err := m.zr.Reset(&m.br); err != nil {
 		putMem(m)
 		return nil, corrupt("zlib header: %v", err)
 	}
@@ -80,7 +163,7 @@ func putMem(m *memInflater) {
 
 // fileInflater inflates a zlib stream read from a file.
 type fileInflater struct {
-	zr      io.ReadCloser
+	zr      zlibReader
 	br      *bufio.Reader
 	scratch [maxLooseHeader]byte
 }
@@ -90,13 +173,7 @@ var filePool = sync.Pool{New: func() any { return &fileInflater{br: bufio.NewRea
 func getFile(r io.Reader) (*fileInflater, error) {
 	f := filePool.Get().(*fileInflater)
 	f.br.Reset(r)
-	var err error
-	if f.zr == nil {
-		f.zr, err = zlib.NewReader(f.br)
-	} else {
-		err = f.zr.(zlib.Resetter).Reset(f.br, nil)
-	}
-	if err != nil {
+	if err := f.zr.Reset(f.br); err != nil {
 		putFile(f)
 		return nil, corrupt("zlib header: %v", err)
 	}

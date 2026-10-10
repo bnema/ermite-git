@@ -170,7 +170,7 @@ func (r *Repo) readLoose(id *ObjectID, dst []byte) (Type, []byte, error) {
 	}
 	dst = grow(dst, int(l.size))
 	copy(dst, l.lead[:l.nlea])
-	if err := inflateExact(l.fi.zr, dst[l.nlea:], l.fi.scratch[:]); err != nil {
+	if err := inflateExact(&l.fi.zr, dst[l.nlea:], l.fi.scratch[:]); err != nil {
 		return 0, nil, wrapLoose(id, err)
 	}
 	return l.typ, dst, nil

@@ -78,7 +78,7 @@ func (r *Repo) openPackedBlob(p *pack, off uint64, id ObjectID) (int64, io.ReadC
 		return 0, nil, err
 	}
 	p.retain()
-	return int64(h.size), &streamBlob{src: m, pack: p, left: int64(h.size), zr: m.zr}, nil
+	return int64(h.size), &streamBlob{src: m, pack: p, left: int64(h.size), zr: &m.zr}, nil
 }
 
 func (r *Repo) openLooseBlob(id *ObjectID) (int64, io.ReadCloser, error) {
@@ -94,7 +94,7 @@ func (r *Repo) openLooseBlob(id *ObjectID) (int64, io.ReadCloser, error) {
 		l.close()
 		return 0, nil, corrupt("loose object %s: size %d", id.String(), l.size)
 	}
-	return int64(l.size), &streamBlob{loose: l, left: int64(l.size), zr: l.fi.zr, lead: l.lead[:l.nlea]}, nil
+	return int64(l.size), &streamBlob{loose: l, left: int64(l.size), zr: &l.fi.zr, lead: l.lead[:l.nlea]}, nil
 }
 
 // memBlob serves a blob rebuilt in memory.
