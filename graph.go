@@ -746,22 +746,32 @@ func (s graphStamp) trusted(at int64) bool {
 	return newest == math.MinInt64 || at-newest > int64(racyWindow)
 }
 
-func statGraphFile(path string) graphFileStamp {
-	st, err := os.Stat(path)
-	if err != nil {
+// graphPaths are the paths statGraph looks at, built once.
+type graphPaths struct{ single, chain statPath }
+
+func newGraphPaths(objectsDir string) graphPaths {
+	return graphPaths{
+		single: newStatPath(objectsDir + "/info/commit-graph"),
+		chain:  newStatPath(objectsDir + "/info/commit-graphs/commit-graph-chain"),
+	}
+}
+
+func statGraphFile(p *statPath) graphFileStamp {
+	st, err := p.stat(false)
+	if err != nil || !st.exists {
 		return graphFileStamp{}
 	}
-	s := graphFileStamp{exists: true, size: st.Size(), mtime: st.ModTime().UnixNano()}
-	s.ino = fileIno(st)
-	return s
+	return graphFileStamp{exists: true, size: st.size, mtime: st.mtime, ino: st.ino}
+}
+
+// stamp returns the stamp of the commit-graph files. Comparing two stamps
+// tells whether openCommitGraph may give another result.
+func (g *graphPaths) stamp() graphStamp {
+	return graphStamp{single: statGraphFile(&g.single), chain: statGraphFile(&g.chain)}
 }
 
 // statGraph returns the stamp of the commit-graph files of objectsDir.
-// Comparing two stamps tells whether openCommitGraph may give another result.
 func statGraph(objectsDir string) graphStamp {
-	info := filepath.Join(objectsDir, "info")
-	return graphStamp{
-		single: statGraphFile(filepath.Join(info, "commit-graph")),
-		chain:  statGraphFile(filepath.Join(info, "commit-graphs", "commit-graph-chain")),
-	}
+	p := newGraphPaths(objectsDir)
+	return p.stamp()
 }

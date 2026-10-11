@@ -70,8 +70,7 @@ func (p *packedRefs) find(name string) (packedRef, bool) {
 // when its stat data changed (or always with force). Concurrent callers share
 // one parse: the check is repeated once pmu is held.
 func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
-	path := r.dir + "/packed-refs"
-	sig, err := statSig(path)
+	sig, err := r.paths.packedRefs.sig()
 	if err != nil {
 		return nil, err
 	}
@@ -88,6 +87,7 @@ func (r *Repo) loadPacked(force bool) (*packedRefs, error) {
 		return cur, nil
 	}
 	read := time.Now().UnixNano()
+	path := r.dir + "/packed-refs"
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		p := &packedRefs{sig: fileSig{read: read}}

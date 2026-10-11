@@ -132,15 +132,15 @@ func (r *Repo) reloadPacks(force bool) (bool, error) {
 	if r.closed {
 		return false, ErrClosed
 	}
-	dir := r.packDir()
 	cur := r.snap.Load()
-	dsig, err := statSig(dir)
+	dsig, err := r.paths.packDir.sig()
 	if err != nil {
 		return false, err
 	}
 	if !force && cur.dirSig.same(dsig) {
 		return false, nil
 	}
+	dir := r.packDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, err

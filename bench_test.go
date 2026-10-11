@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // benchFixture is a repository with loose objects, a deltified pack and a
@@ -412,8 +413,23 @@ func BenchmarkOpenBlob(b *testing.B) {
 	}
 }
 
+// BenchmarkRefresh is Refresh on a repository that did not change, the case
+// of every Refresh but the one after a push. The generated fixture was written
+// a moment ago, inside the racy window of its stat data, so its files are
+// aged first and one Refresh records that they are old.
 func BenchmarkRefresh(b *testing.B) {
 	fx := getBench(b)
+	if os.Getenv("ERMITE_GIT_BENCH_REPO") == "" {
+		old := time.Now().Add(-time.Hour)
+		for _, p := range []string{"packed-refs", "objects/pack", "objects/info/commit-graph", "objects/info/commit-graphs/commit-graph-chain"} {
+			_ = os.Chtimes(fx.r.Dir()+"/"+p, old, old)
+		}
+		for range 3 {
+			if err := fx.r.Refresh(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
 	b.ReportAllocs()
 	for b.Loop() {
 		if err := fx.r.Refresh(); err != nil {

@@ -506,16 +506,15 @@ func (r *Repo) refreshGraph(force bool) error {
 	if cur != nil && cur.err == ErrClosed {
 		return ErrClosed
 	}
-	objects := r.dir + "/objects"
 	// Take the time before the stat data and the content, so that a write
 	// that follows is never mistaken for the version that was loaded.
 	at := r.now().UnixNano()
-	stamp := statGraph(objects)
+	stamp := r.paths.graph.stamp()
 	if cur != nil && !force && cur.stamp == stamp && cur.stamp.trusted(cur.at) {
 		return nil
 	}
 	st := &graphState{stamp: stamp, at: at}
-	g, err := openCommitGraph(objects)
+	g, err := openCommitGraph(r.dir + "/objects")
 	switch {
 	case err == nil:
 		st.g = g

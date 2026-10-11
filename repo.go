@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -75,6 +76,8 @@ type Repo struct {
 	graph atomic.Pointer[graphState] // see walk.go
 	gmu   sync.Mutex                 // serializes commit-graph reloads
 
+	paths *repoPaths // the paths Refresh stats, built once
+
 	clock func() time.Time // tests only: time.Now when nil
 }
 
@@ -109,10 +112,11 @@ func Open(dir string, opts ...Option) (*Repo, error) {
 	if err := checkConfig(filepath.Join(gitDir, "config")); err != nil {
 		return nil, err
 	}
-	if err := checkLayout(gitDir); err != nil {
+	paths := newRepoPaths(gitDir)
+	if err := paths.checkLayout(); err != nil {
 		return nil, err
 	}
-	r := &Repo{dir: gitDir, opts: o, cache: newDeltaCache(o.cacheBytes)}
+	r := &Repo{dir: gitDir, opts: o, cache: newDeltaCache(o.cacheBytes), paths: paths}
 	r.snap.Store(newSnapshot(nil))
 	if _, err := r.reloadPacks(true); err != nil {
 		_ = r.Close()
@@ -151,7 +155,7 @@ func (r *Repo) Close() error {
 // that disappeared stay mapped until the readers using them are done, so a
 // concurrent "git repack -ad" never breaks a read in flight.
 func (r *Repo) Refresh() error {
-	if err := checkLayout(r.dir); err != nil {
+	if err := r.paths.checkLayout(); err != nil {
 		return err
 	}
 	if _, err := r.reloadPacks(false); err != nil {
@@ -202,20 +206,84 @@ func exists(path string) bool {
 	return err == nil
 }
 
-// checkLayout rejects the repository layouts that change what objects or
-// refs mean and that the package does not implement.
-func checkLayout(dir string) error {
-	for _, c := range []struct{ path, why string }{
+// repoPaths holds the paths that Refresh looks at, built once by Open, so
+// that an unchanged repository costs a few stat system calls and no
+// allocation.
+type repoPaths struct {
+	dir string
+
+	// unsupported are the files whose presence makes a repository
+	// unsupported, with the reason.
+	unsupported [4]layoutFile
+	replace     statPath // refs/replace
+	packedRefs  statPath
+	packDir     statPath // objects/pack
+	graph       graphPaths
+
+	mu         sync.Mutex
+	replaceSig fileSig // of refs/replace when it was last listed and found empty
+}
+
+type layoutFile struct {
+	path statPath
+	why  string
+}
+
+func newRepoPaths(dir string) *repoPaths {
+	p := &repoPaths{
+		dir:        dir,
+		replace:    newStatPath(dir + "/refs/replace"),
+		packedRefs: newStatPath(dir + "/packed-refs"),
+		packDir:    newStatPath(dir + "/objects/pack"),
+		graph:      newGraphPaths(dir + "/objects"),
+	}
+	for i, c := range [...]struct{ path, why string }{
 		{"shallow", "shallow repository"},
 		{"info/grafts", "grafts file"},
 		{"commondir", "linked worktree"},
 		{"objects/info/alternates", "alternate object stores"},
 	} {
-		if exists(filepath.Join(dir, c.path)) {
-			return unsupported("%s (%s)", c.why, c.path)
+		p.unsupported[i] = layoutFile{newStatPath(dir + "/" + c.path), c.why}
+	}
+	return p
+}
+
+// checkLayout rejects the repository layouts that change what objects or
+// refs mean and that the package does not implement.
+func checkLayout(dir string) error { return newRepoPaths(dir).checkLayout() }
+
+func (p *repoPaths) checkLayout() error {
+	for i := range p.unsupported {
+		c := &p.unsupported[i]
+		if st, err := c.path.stat(true); err == nil && st.exists {
+			return unsupported("%s (%s)", c.why, strings.TrimPrefix(c.path.path(), p.dir+"/"))
 		}
 	}
-	f, err := os.Open(filepath.Join(dir, "refs", "replace"))
+	return p.checkReplace()
+}
+
+// checkReplace refuses a repository with replace refs. The directory is only
+// listed when its stat data changed since it was last found empty (a replace
+// ref is a file in it, so adding one changes its modification time), with
+// Git's racy rule for a change that leaves the stat data as it was.
+func (p *repoPaths) checkReplace() error {
+	read := time.Now().UnixNano() // before the stat, see sigOf
+	st, err := p.replace.stat(false)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !st.exists || !st.isDir {
+		p.replaceSig = fileSig{}
+		return nil
+	}
+	sig := fileSig{exists: true, size: st.size, mtime: st.mtime, ino: st.ino, read: read}
+	if p.replaceSig.exists && p.replaceSig.same(sig) {
+		return nil
+	}
+	p.replaceSig = fileSig{}
+	f, err := os.Open(p.replace.path())
 	if err != nil {
 		if isNotExist(err) {
 			return nil
@@ -228,6 +296,7 @@ func checkLayout(dir string) error {
 	case rerr == nil && len(names) > 0:
 		return unsupported("replace refs (refs/replace)")
 	case rerr == nil, errors.Is(rerr, io.EOF), isNotExist(rerr):
+		p.replaceSig = sig
 		return nil
 	}
 	return rerr
