@@ -2,7 +2,12 @@
 
 package git
 
-import "time"
+import (
+	"errors"
+	"io"
+	"syscall"
+	"time"
+)
 
 // fileStat is the part of a stat result that change detection uses.
 type fileStat struct {
@@ -47,4 +52,24 @@ func (p *statPath) sig() (fileSig, error) {
 		return fileSig{read: read}, nil
 	}
 	return fileSig{exists: true, size: st.size, mtime: st.mtime, ino: st.ino, read: read}, nil
+}
+
+// readFull reads the file into buf until buf is full or the file ends, and
+// returns the number of bytes. A directory reads as an empty, missing file:
+// dir is true.
+func (f rawFile) readFull(buf []byte) (n int, dir bool, err error) {
+	for n < len(buf) {
+		m, err := f.read(buf[n:])
+		n += m
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if errors.Is(err, syscall.EISDIR) {
+				return 0, true, nil
+			}
+			return n, false, err
+		}
+	}
+	return n, false, nil
 }

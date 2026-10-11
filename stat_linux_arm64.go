@@ -7,3 +7,5 @@ package git
 import "syscall"
 
 const sysFstatat = syscall.SYS_FSTATAT
+
+const sysOpenat = syscall.SYS_OPENAT

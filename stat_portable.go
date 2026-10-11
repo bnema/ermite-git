@@ -26,3 +26,19 @@ func statNul(nul []byte, lstat bool, st *fileStat) error {
 	}
 	return fillStat(st, &sys, nul, err)
 }
+
+// openNul opens the file read-only. It allocates the C string of the path,
+// which stat_linux.go does not.
+func openNul(nul []byte) (rawFile, error) {
+	path := string(nul[:len(nul)-1])
+	for {
+		fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return rawFile{}, err
+		}
+		return rawFile{fd}, nil
+	}
+}

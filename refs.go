@@ -3,6 +3,7 @@
 package git
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -227,28 +228,32 @@ type looseRef struct {
 // readLooseRef reads a loose ref. found is false when there is no such file
 // (or it is a directory).
 func (r *Repo) readLooseRef(name string) (lr looseRef, found bool, err error) {
-	f, err := os.Open(r.dir + "/" + name)
+	// The path goes through a stack buffer and the file is opened with a
+	// plain system call: a ref that does not exist, which is what most
+	// candidates of a revision lookup are, allocates nothing.
+	var arr [256]byte
+	nul := append(arr[:0], r.dir...)
+	nul = append(nul, '/')
+	nul = append(nul, name...)
+	nul = append(nul, 0)
+	file, err := openNul(nul)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if isNotExistErrno(err) {
 			return lr, false, nil
 		}
-		return lr, false, err
+		return lr, false, openError(nul, err)
 	}
-	defer func() { _ = f.Close() }()
+	defer file.close()
 	pb := getBuf()
 	defer putBuf(pb)
 	pb.b = grow(pb.b, maxRefFile+1)
 	buf := pb.b
-	n, err := io.ReadFull(f, buf)
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-		err = nil
-	}
+	n, dir, err := file.readFull(buf)
 	if err != nil {
-		var pe *fs.PathError
-		if errors.As(err, &pe) && errors.Is(pe.Err, syscall.EISDIR) {
-			return lr, false, nil
-		}
-		return lr, false, err
+		return lr, false, &fs.PathError{Op: "read", Path: r.dir + "/" + name, Err: err}
+	}
+	if dir {
+		return lr, false, nil
 	}
 	if n > maxRefFile {
 		return lr, true, corrupt("ref %s is larger than %d bytes", name, maxRefFile)
@@ -261,20 +266,21 @@ func (r *Repo) readLooseRef(name string) (lr looseRef, found bool, err error) {
 }
 
 func parseRefContent(b []byte) (looseRef, error) {
-	s := strings.TrimRight(string(b), " \t\r\n")
-	if target, ok := strings.CutPrefix(s, "ref:"); ok {
-		target = strings.TrimSpace(target)
-		if !validRef(target) {
-			return looseRef{}, corrupt("bad symbolic ref target %q", truncate(target))
+	// On bytes: an id ref, the common case, allocates nothing.
+	b = bytes.TrimRight(b, " \t\r\n")
+	if target, ok := bytes.CutPrefix(b, []byte("ref:")); ok {
+		t := string(bytes.TrimSpace(target))
+		if !validRef(t) {
+			return looseRef{}, corrupt("bad symbolic ref target %q", truncate(t))
 		}
-		return looseRef{symref: target}, nil
+		return looseRef{symref: t}, nil
 	}
-	if len(s) >= 40 {
-		if id, ok := parseIDBytes([]byte(s[:40])); ok && (len(s) == 40 || s[40] == ' ' || s[40] == '\t') {
+	if len(b) >= 40 {
+		if id, ok := parseIDBytes(b[:40]); ok && (len(b) == 40 || b[40] == ' ' || b[40] == '\t') {
 			return looseRef{id: id}, nil
 		}
 	}
-	return looseRef{}, corrupt("bad ref content %q", truncate(s))
+	return looseRef{}, corrupt("bad ref content %q", truncate(string(b)))
 }
 
 // validRootRef reports whether name is a pseudo-ref of the Git directory such
@@ -403,6 +409,18 @@ func (r *Repo) ResolveRef(name string) (ObjectID, error) {
 		return ObjectID{}, notFound("ref %s", name)
 	}
 	return ref.ID, nil
+}
+
+// LookupRefID is like ResolveRef but a ref that does not exist is not an
+// error: ok is false, and nothing is allocated, which makes it the call for
+// trying several candidate names. err is for what went wrong while looking
+// (a closed Repo, an unreadable or corrupt ref).
+func (r *Repo) LookupRefID(name string) (id ObjectID, ok bool, err error) {
+	ref, ok, err := r.lookupRef(name)
+	if err != nil || !ok {
+		return ObjectID{}, false, err
+	}
+	return ref.ID, true, nil
 }
 
 // LookupRef is like ResolveRef but returns the whole Ref.
