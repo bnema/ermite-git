@@ -4,6 +4,7 @@ package git
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 )
@@ -39,6 +40,15 @@ func TestHeaderCacheGetPut(t *testing.T) {
 	hc.put(0, TypeBlob, 0)
 	if typ, size, ok := hc.get(0); !ok || typ != TypeBlob || size != 0 {
 		t.Fatalf("get(0) = %v %v %v", typ, size, ok)
+	}
+	// An offset that would wrap to the empty marker (off+1 == 0) never hits
+	// an empty slot and is never stored.
+	hc.put(math.MaxUint64, TypeBlob, 7)
+	if _, _, ok := hc.get(math.MaxUint64); ok {
+		t.Fatal("MaxUint64 cached")
+	}
+	if _, _, ok := newHeaderCache(1000).get(math.MaxUint64); ok {
+		t.Fatal("MaxUint64 hits an empty slot")
 	}
 	// A size that does not fit a slot is not cached, not truncated.
 	hc.put(99, TypeBlob, maxCachedSize)
@@ -137,5 +147,32 @@ func TestObjectHeaderCached(t *testing.T) {
 	}
 	if deltas == 0 {
 		t.Fatal("no deltified object in the fixture")
+	}
+}
+
+// An offset past the end of the pack is an error, never an answer from an
+// empty cache slot (math.MaxUint64 + 1 wraps to the empty marker).
+func TestPackHeaderOutOfRange(t *testing.T) {
+	f := newFx(t)
+	for i := 0; i < 5; i++ {
+		f.write("f.txt", append(textLines(300, 0), fmt.Sprintf("rev %d\n", i)...), 0o644)
+		f.commit(fmt.Sprintf("commit %d", i))
+	}
+	f.git("repack", "-adf", "--depth=50", "--window=250")
+	r := f.open()
+	p := r.snap.Load().packs[0]
+	for i := range p.idx.n { // allocate the cache
+		off, _ := p.idx.offset(i)
+		if _, _, err := p.header(off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.hdrs.Load() == nil {
+		t.Skip("no deltified object, no cache")
+	}
+	for _, off := range []uint64{uint64(len(p.data)), math.MaxUint64 - 1, math.MaxUint64} {
+		if typ, size, err := p.header(off); err == nil {
+			t.Errorf("header(%d) = %v %d, want an error", off, typ, size)
+		}
 	}
 }

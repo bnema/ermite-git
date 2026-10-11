@@ -3,6 +3,7 @@
 package git
 
 import (
+	"math"
 	"math/bits"
 	"sync/atomic"
 )
@@ -78,6 +79,9 @@ func (s *headerSlot) read(off uint64) (v uint64, ok bool) {
 }
 
 func (c *headerCache) get(off uint64) (Type, int64, bool) {
+	if off == math.MaxUint64 { // off+1 would wrap to the empty marker
+		return 0, 0, false
+	}
 	i, _ := c.index(off)
 	if v, ok := c.slots[i].read(off); ok {
 		return Type(v & 7), int64(v >> 3), true
@@ -89,7 +93,7 @@ func (c *headerCache) get(off uint64) (Type, int64, bool) {
 }
 
 func (c *headerCache) put(off uint64, typ Type, size int64) {
-	if size < 0 || size >= maxCachedSize {
+	if size < 0 || size >= maxCachedSize || off == math.MaxUint64 {
 		return
 	}
 	i, h := c.index(off)

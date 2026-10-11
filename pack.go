@@ -258,6 +258,12 @@ func (p *pack) baseOffset(h *entryHdr, self uint64) (uint64, error) {
 // header returns the type and size of the object at off. The result of a
 // deltified object, which costs an inflate to find, is cached per pack.
 func (p *pack) header(off uint64) (Type, int64, error) {
+	if off >= uint64(len(p.data)) {
+		// Not an entry of this pack: let readHeader reject it, and keep the
+		// cache to real offsets.
+		typ, size, _, err := p.readHeader(off)
+		return typ, size, err
+	}
 	hc := p.hdrs.Load()
 	if hc != nil {
 		if typ, size, ok := hc.get(off); ok {
