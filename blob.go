@@ -14,7 +14,12 @@ import (
 // rebuilt in a pooled buffer first and is bounded by WithMaxObjectSize
 // (ErrTooLarge). The caller must close the reader, which also releases the
 // pack it reads from. Reads detect truncated or oversized data and return
-// ErrCorrupt.
+// ErrCorrupt. The checksum of the stream is verified when the last byte is
+// read: that Read returns (0, ErrCorrupt) instead of the final chunk, so
+// io.ReadFull and io.CopyN of exactly size bytes report a corrupt trailer too.
+// Close returns ErrCorrupt if all size bytes were consumed (or the blob is
+// empty) but the end of the stream was not checked. A reader closed before
+// size bytes were read cannot verify the checksum.
 func (r *Repo) OpenBlob(id ObjectID) (int64, io.ReadCloser, error) {
 	f, err := r.finder()
 	if err != nil {
@@ -155,30 +160,43 @@ func (s *streamBlob) Read(p []byte) (int, error) {
 	if int64(len(p)) > s.left {
 		p = p[:s.left]
 	}
-	n := 0
 	if len(s.lead) > 0 {
-		n = copy(p, s.lead)
+		n := copy(p, s.lead)
 		s.lead = s.lead[n:]
 		s.left -= int64(n)
-		return n, nil
+		return s.served(n)
 	}
 	n, err := s.zr.Read(p)
 	s.left -= int64(n)
 	if err != nil && !errors.Is(err, io.EOF) {
 		s.err = corrupt("blob: %v", err)
-		return n, s.err
+		return 0, s.err
 	}
 	if errors.Is(err, io.EOF) && s.left > 0 {
 		s.err = corrupt("blob shorter than its declared size")
-		return n, s.err
+		return 0, s.err
 	}
 	if n > 0 {
-		return n, nil
+		return s.served(n)
 	}
 	if s.left == 0 {
 		return 0, s.finish()
 	}
 	return 0, nil
+}
+
+// served returns the n > 0 bytes just read. When they are the last ones, it
+// verifies the end of the stream and its checksum before returning them, so a
+// caller that stops at the declared size (io.ReadFull, io.CopyN) still sees a
+// corrupt trailer. On failure the chunk is withheld, (0, err), because
+// io.ReadFull drops an error that comes with a full buffer.
+func (s *streamBlob) served(n int) (int, error) {
+	if s.left == 0 {
+		if err := s.finish(); !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+	}
+	return n, nil
 }
 
 // finish checks that the stream ends exactly here and that its checksum is
@@ -204,6 +222,13 @@ func (s *streamBlob) Close() error {
 	if s.zr == nil {
 		return nil
 	}
+	var err error
+	if s.left == 0 && !s.done {
+		// Nothing was read yet (an empty blob): verify the stream now.
+		if err = s.finish(); errors.Is(err, io.EOF) {
+			err = nil
+		}
+	}
 	s.zr = nil
 	if s.src != nil {
 		putMem(s.src)
@@ -212,5 +237,5 @@ func (s *streamBlob) Close() error {
 	if s.loose != nil {
 		s.loose.close()
 	}
-	return nil
+	return err
 }
