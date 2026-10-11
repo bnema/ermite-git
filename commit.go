@@ -140,7 +140,7 @@ func parseSignature(b []byte) Signature {
 		s.Name = bytes.TrimSpace(b)
 		return s
 	}
-	s.Name = bytes.TrimRight(b[:lt], " ")
+	s.Name = bytes.TrimRight(b[:lt], " \t\r\n")
 	s.Email = b[lt+1 : gt]
 	rest := bytes.TrimLeft(b[gt+1:], " ")
 	secs, rest, _ := bytes.Cut(rest, []byte{' '})

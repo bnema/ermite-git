@@ -818,3 +818,25 @@ func TestConformanceDeltaCacheSizes(t *testing.T) {
 		})
 	}
 }
+
+// The name of a signature loses all its trailing whitespace, as in git's
+// split_ident_line (%an), not only spaces.
+func TestSignatureNameTrimming(t *testing.T) {
+	f := newFx(t)
+	f.write("f", []byte("x\n"), 0o644)
+	f.commit("one")
+	tree := f.git("rev-parse", "HEAD^{tree}")
+	for _, name := range []string{"A B", "A \t\r ", "A\t", "A\r", "A \t B \t", "\tlead \t", "A\v", "A\f", " "} {
+		raw := "tree " + tree + "\nauthor " + name + "<a@b.c> 1700000000 +0100\ncommitter x <a@b.c> 1700000000 +0100\n\nm\n"
+		id := f.gitIn([]byte(raw), "hash-object", "-t", "commit", "-w", "--literally", "--stdin")
+		want := string(runGit(t, f.root(), nil, f.env(), "log", "-1", "--format=%an", id))
+		want = strings.TrimSuffix(want, "\n")
+		var c Commit
+		if err := f.open().ReadCommit(mustID(t, id), &c); err != nil {
+			t.Fatal(err)
+		}
+		if string(c.Author.Name) != want {
+			t.Errorf("author %q: name %q, git %%an %q", name, c.Author.Name, want)
+		}
+	}
+}
