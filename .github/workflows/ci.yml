@@ -34,6 +34,10 @@ jobs:
       - name: System packages
         run: pacman -Syu --noconfirm --needed git gcc
       - uses: actions/checkout@v6
+      # The workspace belongs to the runner user, not root: without this, git does not
+      # treat it as a repository and `git diff a b` compares the two files instead.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
