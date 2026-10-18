@@ -8,7 +8,6 @@ on:
 env:
   # Test the module alone, with the versions in go.mod (never a go.work).
   GOWORK: "off"
-  GOPRIVATE: bnema.dev/ermite*
 
 jobs:
   lint:
@@ -27,9 +26,10 @@ jobs:
   test:
     name: Test
     # The conformance tests compare with git >= 2.45 (git 2.39 of ubuntu-latest
-    # peels nested tags and writes Bloom filters differently). The arch label runs
+    # peels nested tags and writes Bloom filters differently). The job runs in
     # archlinux:latest as root, with a current git.
-    runs-on: arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
     steps:
       - name: System packages
         run: pacman -Syu --noconfirm --needed git gcc
