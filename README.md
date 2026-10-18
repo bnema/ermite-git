@@ -1,5 +1,7 @@
 # ermite-git
 
+> Read-only mirror. Development happens at git.bnema.dev; issues and pull requests are closed here.
+
 A fast, read-only Git repository reader for Go: refs, objects, packfiles, trees and history, using commit-graph and changed-path Bloom filters. Standard library only.
 
 Status: early development, no stable API. Phase A reads refs, loose and packed objects, trees, blobs and commits; phase B adds the commit-graph, changed-path Bloom filters and history walks.
